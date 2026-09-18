@@ -593,15 +593,14 @@ class HGatedDeltaNetForCausalLM(HGatedDeltaNetPreTrainedModel, GenerationMixin):
         if not fuse_linear_and_cross_entropy or labels is None:
             logits = self.lm_head(hidden_states if logits_to_keep is None else hidden_states[:, -logits_to_keep:])
         if labels is not None:
-            if getattr(self, 'criterion', None) is None:
-                if fuse_linear_and_cross_entropy:
-                    criterion = FusedLinearCrossEntropyLoss()
-                elif self.config.fuse_cross_entropy:
-                    criterion = FusedCrossEntropyLoss(inplace_backward=True)
-                else:
-                    criterion = nn.CrossEntropyLoss()
+            # The trainer may install a fused *linear* loss for training.
+            # Evaluation already has logits and requires a logits-only loss.
+            if fuse_linear_and_cross_entropy:
+                criterion = getattr(self, 'criterion', None) or FusedLinearCrossEntropyLoss()
+            elif self.config.fuse_cross_entropy:
+                criterion = FusedCrossEntropyLoss(inplace_backward=True)
             else:
-                criterion = self.criterion
+                criterion = nn.CrossEntropyLoss()
             labels = labels.to(hidden_states.device)
             labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], criterion.ignore_index)), 1)
             if fuse_linear_and_cross_entropy:
