@@ -151,14 +151,14 @@ class HGatedDeltaNet(GatedDeltaNet):
             lambda_level_fixed=LAMBDA_LEVEL_FIXED,
             lambda_level_module=None)
 
-        # dealing with padding
+        # ShortConvolution already zeros padded q/k/v positions. Zero the
+        # recurrent update and hierarchy coefficients at the same positions
+        # so repository examples with padded tails remain exact no-ops.
         if attention_mask is not None:
-            # we don't really support padding
-            if not (attention_mask == 1).all():
-                raise NotImplementedError
-            beta = beta.mul(attention_mask[:, -beta.shape[-2]:, None])
-            g = g.mul(attention_mask[:, -g.shape[-2]:, None])
-            l = l.mul(attention_mask[:, -l.shape[-3]:, None, None])
+            padding_mask = attention_mask[:, -beta.shape[-2]:]
+            beta = beta.mul(padding_mask[..., None])
+            g = g.mul(padding_mask[..., None])
+            l = l.mul(padding_mask[..., None, None])
             if l.dtype != q.dtype:
                 warnings.warn(click.style(
                     f"`l.dtype`: {l.dtype} -> {q.dtype} "
