@@ -102,7 +102,7 @@ def chunk_fwd_kernel_o_intra(
     p_v    = tl.make_block_ptr(v   , (T, V ), (H * V , 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     p_o    = tl.make_block_ptr(o   , (T, V ), (H * V , 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     p_Aw   = tl.make_block_ptr(Aw  , (T, BT), (H * BT, 1), (i_t * BT, 0       ), (BT, BT), (1, 0))
-    p_llut = tl.make_block_ptr(llut, (T, T ), (T     , 1), (i_t * BT, i_t * BT), (BT, BT), (1, 0))
+    p_llut = tl.make_block_ptr(llut, (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0))
 
     b_b  = tl.load(p_b , boundary_check=(0,  ))
     b_g  = tl.load(p_g , boundary_check=(0,  ))
@@ -379,7 +379,7 @@ def chunk_bwd_kernel_dqkgl_intra(
     p_dq   = tl.make_block_ptr(dq  , (T, K ), (H * K , 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
     p_dk   = tl.make_block_ptr(dk  , (T, K ), (H * K , 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
     p_dg   = tl.make_block_ptr(dg  , (T,   ), (H     ,  ), (i_t * BT,         ), (BT,   ), (0,  ))
-    p_llut = tl.make_block_ptr(llut, (T, T ), (T     , 1), (i_t * BT, i_t * BT), (BT, BT), (1, 0))
+    p_llut = tl.make_block_ptr(llut, (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0))
 
     b_q  = tl.load(p_q , boundary_check=(0, 1))
     b_k  = tl.load(p_k , boundary_check=(0, 1))
@@ -488,7 +488,7 @@ def chunk_bwd_kernel_dv_local_intra(
     p_g    = tl.make_block_ptr(g   , (T ,  ), (H,       ), (i_t * BT,         ), (BT,   ), (0,  ))
     p_Aw   = tl.make_block_ptr(Aw  , (BT, T), (1, H * BT), (0       , i_t * BT), (BT, BT), (0, 1))
     p_db   = tl.make_block_ptr(db  , (T ,  ), (H,       ), (i_t * BT,         ), (BT,   ), (0,  ))
-    p_llut = tl.make_block_ptr(llut, (T , T), (T,      1), (i_t * BT, i_t * BT), (BT, BT), (1, 0))
+    p_llut = tl.make_block_ptr(llut, (BT, BT), (BT, 1), (0, 0), (BT, BT), (1, 0))
 
     b_b  = tl.load(p_b , boundary_check=(0,  ))
     b_g  = tl.load(p_g , boundary_check=(0,  ))
@@ -627,7 +627,11 @@ def chunkwise_fwd(
         "b  (cn ct) h -> b h  cn ct  ", ct=chunk_size))),
         "b h cn ct cs -> b cn ct cs h").to(dtype=k.dtype)
 
-    llut = make_levels_matrix(length=T, base=level_base, htype=htype, dtype=torch.int64, device=l.device, clamp_min=0)
+    # Power-of-two aligned diagonal blocks have the same hierarchy indices.
+    # These local kernels never access cross-block entries; the hierarchical
+    # state kernels handle those separately. Avoid the former T-by-T lookup.
+    llut = make_levels_matrix(length=chunk_size, base=level_base, htype=htype,
+                              dtype=torch.int64, device=l.device, clamp_min=0, cached_length=None)
     g    = chunk_local_cumsum(g, chunk_size, offsets=None, head_first=head_first)
     o    = torch.zeros(v.shape, dtype=v.dtype, device=v.device)
     h    = torch.empty(shape_order_h , dtype=k.dtype, device=k.device)
@@ -850,12 +854,13 @@ def chunkwise_bwd(
             raise ValueError(f"V={V} and BV could be {block_size_option}")
 
     llut = make_levels_matrix(
-        length=T,
+        length=chunk_size,
         base=level_base,
         htype=htype,
         dtype=torch.int64,
         device=l.device,
-        clamp_min=0)
+        clamp_min=0,
+        cached_length=None)
 
     if head_first:
         shape_order_k = (B, H,  T, K)

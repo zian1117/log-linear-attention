@@ -58,6 +58,7 @@ class HGatedDeltaNet(GatedDeltaNet):
         layer_idx: int = None,
         norm_eps: float = 1e-5,
         matrix_router: bool = False,
+        max_position_embeddings: int = 16384,
         **kwargs
     ) -> None:
         super().__init__(
@@ -76,15 +77,18 @@ class HGatedDeltaNet(GatedDeltaNet):
         )
 
         self.matrix_router = matrix_router
+        # Keep the historical 16K parameterization, extending it when the
+        # configured context needs additional binary hierarchy levels.
+        self.num_levels = max(MAX_NUM_LEVELS, (max_position_embeddings - 1).bit_length() + 1)
         if matrix_router:
             from hattention.matrix_router_module import MatrixMemoryRouter
             self.router = MatrixMemoryRouter(hidden_size, self.num_heads,
                 self.head_k_dim, self.head_v_dim)
         else:
-            self.lambdas_dim = int(self.num_heads * MAX_NUM_LEVELS)
+            self.lambdas_dim = int(self.num_heads * self.num_levels)
             self.l_proj = nn.Linear(hidden_size, self.lambdas_dim, bias=False)
             self.lambda_mode = "positive"
-            L = torch.ones(self.num_heads, MAX_NUM_LEVELS)
+            L = torch.ones(self.num_heads, self.num_levels)
             self.L = nn.Parameter(L)
             self.L._no_weight_decay = True
 
@@ -151,9 +155,9 @@ class HGatedDeltaNet(GatedDeltaNet):
         g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
         l = None if self.matrix_router else compute_lambda_maybe_fixed(
             L=rearrange(self.L, "h ell -> 1 1 h ell"),
-            dl=rearrange(self.l_proj(hidden_states), "b t (h ell) -> b t h ell", ell=MAX_NUM_LEVELS),
+            dl=rearrange(self.l_proj(hidden_states), "b t (h ell) -> b t h ell", ell=self.num_levels),
             lambda_mode=self.lambda_mode,
-            lambda_level_max=MAX_NUM_LEVELS,
+            lambda_level_max=self.num_levels,
             lambda_level_fixed=LAMBDA_LEVEL_FIXED,
             lambda_level_module=None)
 
@@ -251,6 +255,7 @@ class HGatedDeltaNetBlock(nn.Module):
                 norm_eps=config.norm_eps,
                 layer_idx=layer_idx,
                 matrix_router=getattr(config, 'matrix_router', False),
+                max_position_embeddings=config.max_position_embeddings,
             )
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = GatedDeltaNetMLP(
