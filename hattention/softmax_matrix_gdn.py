@@ -7,7 +7,7 @@ import math
 import torch
 import triton
 import triton.language as tl
-from torch.nn import functional as F
+from .matrix_routing_reduce import RoutingReduce
 from fla.modules.l2norm import l2_norm
 
 
@@ -99,17 +99,6 @@ class BucketReads(torch.autograd.Function):
         return dk,dw,dv,da,dreads,None
 
 
-@torch.compile
-def _route_and_reduce(values,keys,query,temperature,active):
-    # Compilation fuses the normalization, masked softmax and weighted sum;
-    # intermediate FP32 copies of all bucket values are unnecessary.
-    keys=F.normalize(keys.float(),dim=-1,eps=1e-6)
-    query=F.normalize(query.float(),dim=-1,eps=1e-6)
-    scores=(keys*query.unsqueeze(-2)).sum(-1)*temperature.exp()
-    weights=scores.masked_fill(~active,-torch.inf).softmax(-1)
-    return (weights.unsqueeze(-1)*values.float()).sum(-2).to(values.dtype)
-
-
 def softmax_matrix_gdn(q,k,v,g,beta,query,probe,log_temperature):
     B,T,H,K=k.shape
     V=v.shape[-1]
@@ -163,10 +152,7 @@ def softmax_matrix_gdn(q,k,v,g,beta,query,probe,log_temperature):
         ys.append(both[...,:C,:]);cs.append(both[...,C:,:])
     values=torch.stack(ys,-2)
     keys=torch.stack(cs,-2)
-    times=torch.arange(T,device=k.device).reshape(N,C,1)
-    ell=torch.arange(L,device=k.device)
-    active=(ell==0)|(((times>>((ell-1).clamp_min(0)))&1)!=0)
     routed_query=chunks(query)
     temperature=log_temperature.float().unsqueeze(0).expand(B,-1).reshape(B*H,1,1,1)
-    out=_route_and_reduce(values,keys,routed_query,temperature,active)
+    out=RoutingReduce.apply(values,keys,routed_query,temperature)
     return out.reshape(B,H,N,C,V).permute(0,2,3,1,4).reshape(B,T,H,V)
