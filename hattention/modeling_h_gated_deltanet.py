@@ -57,6 +57,7 @@ class HGatedDeltaNet(GatedDeltaNet):
         conv_bias: bool = False,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
+        matrix_router: bool = False,
         **kwargs
     ) -> None:
         super().__init__(
@@ -74,13 +75,18 @@ class HGatedDeltaNet(GatedDeltaNet):
             **kwargs
         )
 
-        self.lambdas_dim = int(self.num_heads * MAX_NUM_LEVELS)
-        self.l_proj = nn.Linear(hidden_size, self.lambdas_dim, bias=False)
-
-        self.lambda_mode = "positive"
-        L = torch.ones(self.num_heads, MAX_NUM_LEVELS)
-        self.L = nn.Parameter(L)
-        self.L._no_weight_decay = True
+        self.matrix_router = matrix_router
+        if matrix_router:
+            from hattention.matrix_router_module import MatrixMemoryRouter
+            self.router = MatrixMemoryRouter(hidden_size, self.num_heads,
+                self.head_k_dim, self.head_v_dim)
+        else:
+            self.lambdas_dim = int(self.num_heads * MAX_NUM_LEVELS)
+            self.l_proj = nn.Linear(hidden_size, self.lambdas_dim, bias=False)
+            self.lambda_mode = "positive"
+            L = torch.ones(self.num_heads, MAX_NUM_LEVELS)
+            self.L = nn.Parameter(L)
+            self.L._no_weight_decay = True
 
     def forward(
         self,
@@ -143,7 +149,7 @@ class HGatedDeltaNet(GatedDeltaNet):
         v = rearrange(v, 'b t (h d) -> b t h d', d=self.head_v_dim)
         beta = self.b_proj(hidden_states).sigmoid()
         g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
-        l = compute_lambda_maybe_fixed(
+        l = None if self.matrix_router else compute_lambda_maybe_fixed(
             L=rearrange(self.L, "h ell -> 1 1 h ell"),
             dl=rearrange(self.l_proj(hidden_states), "b t (h ell) -> b t h ell", ell=MAX_NUM_LEVELS),
             lambda_mode=self.lambda_mode,
@@ -158,16 +164,26 @@ class HGatedDeltaNet(GatedDeltaNet):
             padding_mask = attention_mask[:, -beta.shape[-2]:]
             beta = beta.mul(padding_mask[..., None])
             g = g.mul(padding_mask[..., None])
-            l = l.mul(padding_mask[..., None, None])
-            if l.dtype != q.dtype:
+            if l is not None:
+                l = l.mul(padding_mask[..., None, None])
+            if l is not None and l.dtype != q.dtype:
                 warnings.warn(click.style(
                     f"`l.dtype`: {l.dtype} -> {q.dtype} "
                     f"(`self.L.dtype` = {self.L.dtype})",
                     fg="red"))
                 l = l.to(dtype=q.dtype)
 
+        if self.matrix_router:
+            if use_cache or past_key_values is not None:
+                raise NotImplementedError('Matrix routing currently supports full-sequence training/evaluation; use_cache=False is required.')
+
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
-        if mode == 'chunk':
+        if self.matrix_router:
+            o = self.router(hidden_states, q, k, v, g, beta)
+            recurrent_state = None
+            if attention_mask is not None:
+                o = o * padding_mask[..., None, None]
+        elif mode == 'chunk':
             o, recurrent_state = chunk_h_gated_delta_rule(
                 q=q,
                 k=k,
@@ -233,7 +249,8 @@ class HGatedDeltaNetBlock(nn.Module):
                 use_short_conv=config.use_short_conv,
                 conv_size=config.conv_size,
                 norm_eps=config.norm_eps,
-                layer_idx=layer_idx
+                layer_idx=layer_idx,
+                matrix_router=getattr(config, 'matrix_router', False),
             )
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = GatedDeltaNetMLP(
@@ -306,8 +323,9 @@ class HGatedDeltaNetPreTrainedModel(PreTrainedModel):
             module.A_log._no_weight_decay = True
 
             # --- L ---
-            nn.init.ones_(module.L)
-            module.L._no_weight_decay = True
+            if hasattr(module, 'L'):
+                nn.init.ones_(module.L)
+                module.L._no_weight_decay = True
 
             # --- dt_bias ---
             # hard coded for now
