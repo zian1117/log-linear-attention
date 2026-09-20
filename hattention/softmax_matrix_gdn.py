@@ -99,19 +99,9 @@ class BucketReads(torch.autograd.Function):
         return dk,dw,dv,da,dreads,None
 
 
-def softmax_matrix_gdn(q,k,v,g,beta,query,probe,log_temperature):
-    B,T,H,K=k.shape
-    V=v.shape[-1]
+@torch.compile
+def _prepare(q,k,v,b,gc,probe,L):
     C=64
-    assert T % C == 0, 'Training/evaluation sequences must be padded to a multiple of 64.'
-    N=T//C
-    L=(T-1).bit_length()+1
-    q,k=l2_norm(q),l2_norm(k)
-    def chunks(x):
-        return x.reshape(B,N,C,H,*x.shape[3:]).movedim(3,1).reshape(B*H,N,C,*x.shape[3:]).contiguous()
-    q,k,v=map(chunks,(q,k,v))
-    b=chunks(beta)
-    gc=chunks(g).float().cumsum(-1)
     # The unit-diagonal triangular solve is local to a 64-token chunk.
     # Decay factors are applied after solving, avoiding exp(-g) overflow.
     with torch.autocast('cuda',enabled=False):
@@ -126,7 +116,6 @@ def softmax_matrix_gdn(q,k,v,g,beta,query,probe,log_temperature):
     w=(inv.to(k.dtype)@(b.unsqueeze(-1)*k))
     u=((inv*decay).to(v.dtype)@(b.unsqueeze(-1)*v))
     qk=(q@k.transpose(-1,-2)).tril()
-    probe=probe.to(k.dtype).unsqueeze(0).expand(B,-1,-1).reshape(B*H,1,1,K)
     pk=(probe@k.transpose(-1,-2)).expand(-1,-1,C,-1).tril()
     # Shared local linear operator for both the retrieval and routing reads.
     aq=((qk@inv.to(q.dtype)).float()*decay*b.unsqueeze(-2)).to(v.dtype)
@@ -145,6 +134,24 @@ def softmax_matrix_gdn(q,k,v,g,beta,query,probe,log_temperature):
         mask=(levels==level)&causal
         ys.append(aq.masked_fill(~mask,0.)@v)
         cs.append(ap.masked_fill(~mask,0.)@v)
+    return kn,wn,u,end,qn,pn,ys,cs
+
+
+def softmax_matrix_gdn(q,k,v,g,beta,query,probe,log_temperature):
+    B,T,H,K=k.shape
+    V=v.shape[-1]
+    C=64
+    assert T % C == 0, 'Training/evaluation sequences must be padded to a multiple of 64.'
+    N=T//C
+    L=(T-1).bit_length()+1
+    q,k=l2_norm(q),l2_norm(k)
+    def chunks(x):
+        return x.reshape(B,N,C,H,*x.shape[3:]).movedim(3,1).reshape(B*H,N,C,*x.shape[3:]).contiguous()
+    q,k,v=map(chunks,(q,k,v))
+    b=chunks(beta)
+    gc=chunks(g).float().cumsum(-1)
+    probe=probe.to(k.dtype).unsqueeze(0).expand(B,-1,-1).reshape(B*H,1,1,K)
+    kn,wn,u,end,qn,pn,ys,cs=_prepare(q,k,v,b,gc,probe,L)
     reads=torch.cat((qn,pn),dim=-2)
     for level in range(7,L):
         period=1<<(level-6)
