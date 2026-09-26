@@ -1,4 +1,8 @@
 """Experimental coarse routing that reuses the state scan's projections."""
+from functools import lru_cache
+from types import FunctionType
+import math
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -33,10 +37,40 @@ from .fused_projected_coarse_router import fused_projected_coarse_core as _core
 _checkpoint_core = torch.compile(_core, fullgraph=True, dynamic=True)
 
 
+def _grouped_core_impl(*args):
+    return _core(*args, raw_half=_GROUPED_RAW_HALF, head_groups=_GROUPED_HEAD_GROUPS)
+
+
+# Compiled clones below replace these structural constants in their globals.
+# Their independent code objects avoid exhausting one Dynamo cache across
+# hierarchy periods and then again when the training batch size changes.
+_GROUPED_RAW_HALF, _GROUPED_HEAD_GROUPS = 0, 1
+
+
+@lru_cache(maxsize=None)
+def _compiled_grouped_core(half, groups):
+    name = f'_grouped_coarse_{half}_{groups}'
+    namespace = dict(globals(), _GROUPED_RAW_HALF=half, _GROUPED_HEAD_GROUPS=groups)
+    function = FunctionType(_grouped_core_impl.__code__.replace(co_name=name), namespace, name)
+    return torch.compile(function, fullgraph=True, dynamic=True)
+
+
+def _check_grouped_view(x, half):
+    tail = x.shape[2:]
+    width = math.prod(tail)
+    expected = [2*half*width, width]
+    for dimension in tail:
+        width //= dimension
+        expected.append(width)
+    if x.shape[1] != half or any(size > 1 and actual != wanted
+                               for size,actual,wanted in zip(x.shape,x.stride(),expected)):
+        raise ValueError('Expected a grouped active-half view of contiguous raw chunks.')
+
+
 def projected_coarse(kn, wn, writes, end, rn, qn, k, beta, gc, u, temperature,
                      period, terms, mass_decay, mass_addition, floor, output_dtype,
                      return_masks=False, selected_inputs=None, state_pair=None,
-                     state_pair_active=False):
+                     state_pair_active=False, selected_inputs_grouped=False):
     key_dim,value_dim = k.shape[-1],writes.shape[-1]
     kp = max(16,triton.next_power_of_2(key_dim))-key_dim
     vp = max(16,triton.next_power_of_2(value_dim))-value_dim
@@ -53,11 +87,32 @@ def projected_coarse(kn, wn, writes, end, rn, qn, k, beta, gc, u, temperature,
     chunks = k.shape[1]
     if state_pair is None or not state_pair_active:
         state,projected = (active_select(x,period) for x in (state,projected))
+    if selected_inputs_grouped and (selected_inputs is None or chunks % period):
+        raise ValueError('Grouped raw inputs require supplied complete-period views.')
     rn,qn,k,beta,gc,u = (tuple(active_select(x,period) for x in (rn,qn,k,beta,gc,u))
                         if selected_inputs is None else selected_inputs)
     mass0 = active_select(boundary_mass(mass_decay,mass_addition,period),period)
+    if selected_inputs_grouped:
+        batch, active = projected.shape[:2]
+        half, groups = period//2, chunks//period
+        for x in (rn,qn,k,beta,gc,u):
+            if x.shape[:2] != (batch*groups,half):
+                raise ValueError('Grouped raw input batch dimensions do not match the state.')
+            _check_grouped_view(x,half)
+        projected = projected.reshape(batch*groups,half,*projected.shape[2:])
+        state = state.reshape(batch*groups,half,*state.shape[2:])
+        mass0 = mass0.reshape(batch*groups,half)
     args = (projected,beta,k,gc,state,rn,qn,u,temperature,mass0,floor,output_dtype,return_masks)
-    y,score,*diagnostic = _checkpoint_core(*args) if torch.is_grad_enabled() else _core(*args)
+    if selected_inputs_grouped:
+        if torch.is_grad_enabled():
+            y,score,*diagnostic = _compiled_grouped_core(half,groups)(*args)
+        else:
+            y,score,*diagnostic = _core(*args,raw_half=half,head_groups=groups)
+        y,score = (x.reshape(batch,active,*x.shape[2:]) for x in (y,score))
+        if return_masks:
+            diagnostic = [x.reshape(batch,active,*x.shape[2:]) for x in diagnostic]
+    else:
+        y,score,*diagnostic = _checkpoint_core(*args) if torch.is_grad_enabled() else _core(*args)
     if return_masks:
         diagnostic = [active_scatter(x,chunks,period) for x in diagnostic]
     return active_scatter(y,chunks,period),active_scatter(score,chunks,period),*diagnostic

@@ -1,4 +1,4 @@
-"""Experimental joint backward for multiple projected Fenwick state scans.
+"""Projected Fenwick states with compact shared-tree and scan backends.
 
 The scans themselves are unchanged. Their matrix gradients accumulate in
 the existing FP32 cuBLAS products' epilogues, avoiding a dense temporary
@@ -136,10 +136,10 @@ def multi_projected_states(k,z,factor,value,decay,periods, *, active_outputs=Fal
 
 Inputs match ProjectedStates: k/z [B,N,C,K], factor [B,N,C],
 value [B,N,C,V], decay [B,N]. Odd feature/chunk dimensions are padded
-internally for the unchanged tensor-core scan kernels.
+internally for the tensor-core kernels.
 With active_outputs=True, return only second-half chunks of each period;
-backward reads their compact direct gradients without dense expansion. The
-complete prefix states and recurrent gradients are retained internally.
+complete binary chunk groups use a shared affine tree and its joint adjoint.
+Partial groups, non-binary periods, and full outputs retain the original scan.
 """
     periods = tuple(periods)
     if not periods:
@@ -161,6 +161,13 @@ complete prefix states and recurrent gradients are retained internally.
               F.pad(z,(0,kp,0,cp)) if kp or cp else z,
               F.pad(factor,(0,cp)) if cp else factor,
               F.pad(value,(0,vp,0,cp)) if vp or cp else value,decay)
-    flat = _MultiProjectedStates.apply(*inputs,periods,active_outputs)
-    return tuple((flat[2*i][...,:key_dim,:value_dim],flat[2*i+1][...,:chunk,:value_dim])
-                 for i in range(len(periods)))
+    chunks = k.shape[1]
+    if (active_outputs and not (chunks & (chunks - 1))
+            and all(not (period & (period - 1)) for period in periods)):
+        from .projected_state_tree import projected_state_tree
+        pairs = projected_state_tree(*inputs, periods, active_outputs=True)
+    else:
+        flat = _MultiProjectedStates.apply(*inputs,periods,active_outputs)
+        pairs = tuple((flat[2*i], flat[2*i+1]) for i in range(len(periods)))
+    return tuple((state[...,:key_dim,:value_dim], projected[...,:chunk,:value_dim])
+                 for state, projected in pairs)

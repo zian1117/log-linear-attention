@@ -69,7 +69,10 @@ class _TupleRoutingReduce(torch.autograd.Function):
     @staticmethod
     def backward(ctx, gradient):
         levels = ctx.levels
-        ys, scores = ctx.saved_tensors[:levels], ctx.saved_tensors[levels:]
+        # Non-reentrant checkpointing permits each saved tensor to be
+        # unpacked once during a backward invocation.
+        saved = ctx.saved_tensors
+        ys, scores = saved[:levels], saved[levels:]
         dys, dls = tuple(torch.empty_like(x) for x in ys), tuple(torch.empty_like(x) for x in scores)
         bh, n, c, value_dim = ys[0].shape
         _tuple_reduce[(bh*n*c,)](ys, scores, None, gradient.contiguous(), dys, dls,

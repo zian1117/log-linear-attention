@@ -55,8 +55,12 @@ def _finish_forward(KP, BETA, GC, TEMPERATURE, Z2, NUM, H2,
                     SCORE, STATS, BOUND,
                     N: tl.constexpr, C: tl.constexpr, K: tl.constexpr,
                     CB: tl.constexpr, KB: tl.constexpr, VT: tl.constexpr,
-                    VTB: tl.constexpr, FLOOR2: tl.constexpr, SHARED_TEMP: tl.constexpr):
+                    VTB: tl.constexpr, FLOOR2: tl.constexpr, SHARED_TEMP: tl.constexpr,
+                     RAW_HALF: tl.constexpr=0, HEAD_GROUPS: tl.constexpr=1):
     batch = tl.program_id(0)
+    raw_delta = 0
+    if RAW_HALF:
+        raw_delta = (batch // RAW_HALF) * RAW_HALF
     c, kk, tile = tl.arange(0, CB), tl.arange(0, KB), tl.arange(0, VTB)
     zp = tl.load(Z2 + (batch*VT+tile[:, None])*C+c[None, :],
                  (tile[:, None] < VT) & (c[None, :] < C), 0)
@@ -64,11 +68,11 @@ def _finish_forward(KP, BETA, GC, TEMPERATURE, Z2, NUM, H2,
                  (tile[:, None] < VT) & (c[None, :] < C), 0)
     z2, numerator = tl.sum(zp, 0), tl.sum(np, 0)
     initial = tl.sum(tl.load(H2+batch*VT+tile, tile < VT, 0), 0)
-    key = tl.load(KP+batch*C*K+c[:, None]*K+kk[None, :],
+    key = tl.load(KP+batch*C*K+c[:, None]*K+kk[None, :]+raw_delta*(C*K),
                   (c[:, None] < C) & (kk[None, :] < K), 0)
     key2 = tl.sum(key*key, 1)
-    beta = tl.load(BETA+batch*C+c, c < C, 0)
-    gc = tl.load(GC+batch*C+c, c < C, 0).to(tl.float64)
+    beta = tl.load(BETA+batch*C+c+raw_delta*C, c < C, 0)
+    gc = tl.load(GC+batch*C+c+raw_delta*C, c < C, 0).to(tl.float64)
     coefficient = beta*(2.-beta*key2)
     energy = coefficient*z2
     raw = initial-tl.cumsum(energy, 0)
@@ -76,7 +80,7 @@ def _finish_forward(KP, BETA, GC, TEMPERATURE, Z2, NUM, H2,
     norm2 = gain*raw
     bound = gain*(initial+tl.cumsum(tl.abs(energy), 0))
     inverse = tl.rsqrt(tl.maximum(norm2, FLOOR2))
-    ti = 0 if SHARED_TEMP else batch//N
+    ti = 0 if SHARED_TEMP else (batch//N)//HEAD_GROUPS
     temperature = tl.load(TEMPERATURE+ti).to(tl.float64)
     score = (temperature*numerator.to(tl.float64))*inverse.to(tl.float64)
     tl.store(SCORE+batch*C+c, score, c < C)
@@ -93,18 +97,22 @@ def _finish_forward(KP, BETA, GC, TEMPERATURE, Z2, NUM, H2,
 def _scalar_backward(BETA, GC, TEMPERATURE, STATS, DS,
                      DN, DZCOEF, DKCOEF, DI, DBETA, DGC, DT,
                      N: tl.constexpr, C: tl.constexpr, CB: tl.constexpr,
-                     FLOOR2: tl.constexpr, SHARED_TEMP: tl.constexpr):
+                     FLOOR2: tl.constexpr, SHARED_TEMP: tl.constexpr,
+                     RAW_HALF: tl.constexpr=0, HEAD_GROUPS: tl.constexpr=1):
     batch = tl.program_id(0)
+    raw_delta = 0
+    if RAW_HALF:
+        raw_delta = (batch // RAW_HALF) * RAW_HALF
     c = tl.arange(0, CB)
     norm2 = tl.load(STATS+(batch*5+0)*C+c, c < C, 0)
     raw = tl.load(STATS+(batch*5+1)*C+c, c < C, 0)
     numerator = tl.load(STATS+(batch*5+2)*C+c, c < C, 0)
     z2 = tl.load(STATS+(batch*5+3)*C+c, c < C, 0)
     key2 = tl.load(STATS+(batch*5+4)*C+c, c < C, 0)
-    beta = tl.load(BETA+batch*C+c, c < C, 0)
-    gc = tl.load(GC+batch*C+c, c < C, 0).to(tl.float64)
+    beta = tl.load(BETA+batch*C+c+raw_delta*C, c < C, 0)
+    gc = tl.load(GC+batch*C+c+raw_delta*C, c < C, 0).to(tl.float64)
     ds = tl.load(DS+batch*C+c, c < C, 0).to(tl.float64)
-    ti = 0 if SHARED_TEMP else batch//N
+    ti = 0 if SHARED_TEMP else (batch//N)//HEAD_GROUPS
     temperature = tl.load(TEMPERATURE+ti).to(tl.float64)
     inverse = tl.rsqrt(tl.maximum(norm2, FLOOR2))
     intermediate = ds*inverse.to(tl.float64)
@@ -164,15 +172,19 @@ def _project_backward(Z, Q, H, U, DN, DZCOEF, DZ, DQ, DU,
 
 @triton.jit
 def _activation_backward(ZREAD, QREAD, U, DN, DZCOEF, DZ, DQ, DU,
-                         SIZE: tl.constexpr, V: tl.constexpr, BLOCK: tl.constexpr):
+                         SIZE: tl.constexpr, V: tl.constexpr, BLOCK: tl.constexpr,
+                         RAW_HALF: tl.constexpr=0, RAW_C: tl.constexpr=1):
     offset = tl.program_id(0)*BLOCK+tl.arange(0, BLOCK)
+    raw_delta = 0
+    if RAW_HALF:
+        raw_delta = (offset // (RAW_C*V*RAW_HALF)) * (RAW_C*V*RAW_HALF)
     mask = offset < SIZE
     row = offset//V
     dn = tl.load(DN+row, mask, 0)
     coefficient = tl.load(DZCOEF+row, mask, 0)
     z = tl.load(ZREAD+offset, mask, 0)
     q = tl.load(QREAD+offset, mask, 0)
-    u = tl.load(U+offset, mask, 0)
+    u = tl.load(U+offset+raw_delta, mask, 0)
     tl.store(DZ+offset, coefficient*z, mask)
     tl.store(DQ+offset, dn*u, mask)
     tl.store(DU+offset, dn*q, mask)

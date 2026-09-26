@@ -98,6 +98,32 @@ class TestTupleRoutingReduce(unittest.TestCase):
     def test_cuda_values_all_gradients_and_extreme_scores(self):
         run('cuda')
 
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required')
+    def test_non_reentrant_checkpoint_preserves_all_gradients(self):
+        from torch.utils.checkpoint import checkpoint
+        torch.manual_seed(371)
+        levels, shape = 5, (2, 2, 5, 7)
+        for dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                raw = tuple(torch.randn(shape, device='cuda', dtype=dtype)
+                            for _ in range(levels))
+                raw += tuple(torch.randn(shape[:-1], device='cuda', dtype=torch.float64)
+                             for _ in range(levels))
+                actual = tuple(x.detach().requires_grad_() for x in raw)
+                expected = tuple(x.detach().clone().requires_grad_() for x in raw)
+
+                def reduce(*inputs):
+                    return tuple_routing_reduce(inputs[:levels], inputs[levels:], 19**-.5)
+
+                result = checkpoint(reduce, *actual, use_reentrant=False)
+                reference_output = reduce(*expected)
+                gradient = torch.randn_like(result)
+                got = torch.autograd.grad(result, actual, gradient)
+                want = torch.autograd.grad(reference_output, expected, gradient)
+                torch.testing.assert_close(result, reference_output, rtol=0, atol=0)
+                for a, b in zip(got, want):
+                    torch.testing.assert_close(a, b, rtol=0, atol=0)
+
     @unittest.skipUnless(os.environ.get('TRITON_INTERPRET') == '1',
                          'set TRITON_INTERPRET=1 for CPU kernel interpretation')
     def test_cpu_interpreter_values_all_gradients_and_extreme_scores(self):

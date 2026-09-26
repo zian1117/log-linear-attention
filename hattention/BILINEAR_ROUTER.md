@@ -72,12 +72,14 @@ original Fenwick periods and their write halves are unchanged. Backward also
 reuses the guard's FP64 key-times-adjoint product, recomputing it for every
 period whose adjoint the guard replaces; no precision check is relaxed.
 
-The public boundary scan returns only the chunks in each Fenwick period's
-active half. Backward reads those compact direct gradients and supplies zero
-for the inactive positions internally, avoiding a dense gradient expansion
-at each level. Every preceding write and erase still participates in the
-state recurrence and receives its full gradient; complete boundary histories
-remain saved for parameter-gradient computation. Precise cache rows are gathered
+For complete power-of-two chunk groups, the public backend shares affine
+transition summaries in a binary tree across hierarchy levels. It returns
+only each period's active-half boundary states. Backward sums all consumer
+gradients before reversing each shared summary once. Partial/nonbinary chunk
+groups retain the original state scan. Every preceding write and erase still
+participates in the recurrence and receives its gradient. Complete-period
+coarse reads use strided views of their raw inputs, avoiding copies at each
+level; their backward contributions are reduced jointly. Precise cache rows are gathered
 across repair levels together, so backward accumulates into one FP64 destination
 per cache tensor. Duplicate indices and unused outputs remain supported. This
 removes repeated destination allocation and summation; it does not change the
@@ -95,8 +97,8 @@ dimension 64, versus the previous `single_probe` implementation (`e8fcd9f`):
 
 | GPU / job | Bilinear layer | Reference layer | Ratio | Peak allocated memory, new / reference |
 | --- | ---: | ---: | ---: | ---: |
-| L40S / 23999279 | 0.7128 s | 0.4372 s | 1.63x | 30.11 / 13.75 GB |
-| H200 / 23999273 | 0.1920 s | 0.07341 s | 2.61x | 30.13 / 13.80 GB |
+| L40S / 24001359 | 0.6807 s | 0.4370 s | 1.56x | 27.74 / 13.75 GB |
+| H200 / 24002110 | 0.2054 s | 0.08014 s | 2.56x | 27.79 / 13.80 GB |
 
 These are warmed layer measurements with common parameters matched, using an
 initialized first layer and saved validation tokens; they are not complete
@@ -126,6 +128,8 @@ python tests/test_adaptive_matrix_gdn.py
 python tests/test_cached_chunk_reads.py
 python tests/test_multi_active_select.py
 python tests/test_multi_projected_states.py
+python tests/test_projected_state_tree.py
+python tests/test_coarse_active_views.py
 python tests/test_compact_projected_states.py
 python tests/test_shared_precise_input_cache.py
 python tests/test_stable_write_energy.py
@@ -179,10 +183,11 @@ and 8.40e-7, respectively; cold and warm results were identical. Three CPU
 integration regressions also passed. Model lifecycle tests were unchanged
 and passed on the preceding grouped-cache implementation.
 
-A separate scratch experiment sharing affine tree summaries was accurate on
-the captured input but slower than the existing state scan: H200 `23998100`
-measured 69.46 ms versus 35.67 ms for compact state forward/backward, excluding
-factor preparation. That tree is not used by production dispatch.
+The first native-PyTorch affine-tree prototype was slower than the scan.
+The selected implementation instead uses TF32x3 matrix kernels, fused output
+operations, and a joint analytical backward. Its tests include independent
+FP64 state/gradient references, duplicate and unused outputs, arbitrary feature
+dimensions, and preservation of the original fallback scan.
 
 Remaining work:
 - Reach the requested matched per-layer runtime target without weakening
@@ -248,3 +253,38 @@ Separate compiled 16K public/reference checks passed with maximum reported
 relative gradient errors 7.98e-7 and 8.84e-7; cold/warm results were identical.
 These arithmetic fixes preserve the model equations and existing guard
 thresholds. Their effect on training quality remains unmeasured.
+
+The broader audit has also reproduced **unresolved coarse routing-gradient
+cancellation**. In two constructed GPU cases, the relative L2 error in the
+source write's sigmoid-parameter gradient was 43% and 28%, although output
+differences were below 5e-9. Detaching only the routing scores removed nearly
+all of that discrepancy. A CPU example with a moderate aligned erasure shows
+the related problem for erase strength. These are conditioning failures in
+the tested gradients, not measurements of training prevalence or loss impact.
+Additional numerical diagnostics and algebraic changes remain under study;
+the existing diagnostics do not yet catch all these cases.
+
+A separate actual bug in non-reentrant gradient checkpointing was fixed:
+reducer backward accessed `ctx.saved_tensors` twice, triggering a second
+unpack forbidden by checkpoint recomputation. Backward now unpacks once.
+The focused checkpointed-versus-plain regression preserves outputs and every
+input gradient bit for bit in FP32 and BF16 on both tested GPUs.
+
+Shared-tree and input-view validation: H200 `24001358` and L40S `24001359`
+passed the new view tests, stress cases, and fresh-process compiled 16K checks.
+Maximum reported per-head gradient relative L2 errors against the precise
+backend were 6.87e-7 and 6.52e-7; cold and warm results were identical.
+Compiled grouped and compact inputs give bit-identical outputs and gradients;
+independent eager comparisons also match exactly.
+
+All eight model lifecycle tests passed on H200 `24002110` and L40S `24002140`,
+including non-reentrant gradient checkpointing and legacy compatibility. A
+partial-period oracle test now uses independent input/factor graphs so each
+compiled backward can release its buffers normally; its tolerances were not
+relaxed. Frozen-source hashes were verified for these jobs.
+
+Further tests of final softmax reduction followed by gated RMSNorm covered ten
+FP32/BF16 cases: saturation, cancelling reads, tiny reads, and reads near the
+RMSNorm floor. No additional consequential failure was found. This CPU Triton
+interpreter audit supplements the native GPU tests; it does not replace them.
+The outstanding coarse-gradient cases above remain unresolved in this commit.

@@ -106,22 +106,30 @@ class ConfigurationTests(unittest.TestCase):
                 terms = (gram, inverse, decay, inverse @ (beta.unsqueeze(-1) * k))
                 arguments = (kn, wn, writes, end, rn, qn, k, beta, gc, u, temperature)
                 actual_y, actual_score = _coarse(*arguments, period, terms, 1e-6, torch.float64)
-                state = BucketStates.apply(kn, wn, writes, end, period)
-                norm2 = high_bucket_norm2(k, beta, gc, state, terms=terms)
+                # Independent leaves and factor graph let each compiled backward
+                # release its buffers normally; graph retention is unnecessary.
+                reference_arguments = tuple(x.detach().clone().requires_grad_() for x in arguments)
+                (ref_kn, ref_wn, ref_writes, ref_end, ref_rn, ref_qn,
+                 ref_k, ref_beta, ref_gc, ref_u, ref_temperature) = reference_arguments
+                ref_gram, ref_inverse, ref_decay = _terms(ref_k, ref_beta, ref_gc)
+                ref_terms = (ref_gram, ref_inverse, ref_decay,
+                             ref_inverse @ (ref_beta.unsqueeze(-1) * ref_k))
+                state = BucketStates.apply(ref_kn, ref_wn, ref_writes, ref_end, period)
+                norm2 = high_bucket_norm2(ref_k, ref_beta, ref_gc, state, terms=ref_terms)
                 active = (torch.arange(chunks) % period >= period // 2).view(1, chunks, 1)
-                expected_y = (rn @ state) * active.unsqueeze(-1)
-                expected_score = _score(qn @ state, u, norm2, temperature, 1e-6) * active
+                expected_y = (ref_rn @ state) * active.unsqueeze(-1)
+                expected_score = _score(ref_qn @ state, ref_u, norm2, ref_temperature, 1e-6) * active
                 torch.testing.assert_close(actual_y, expected_y, rtol=1e-11, atol=1e-12)
                 torch.testing.assert_close(actual_score, expected_score, rtol=1e-11, atol=1e-12)
                 output_gradient = torch.randn_like(expected_y)
                 score_gradient = torch.randn_like(expected_score)
                 actual_grad = torch.autograd.grad(
                     (actual_y * output_gradient).sum() + (actual_score * score_gradient).sum(),
-                    arguments, retain_graph=True,
+                    arguments,
                 )
                 expected_grad = torch.autograd.grad(
                     (expected_y * output_gradient).sum() + (expected_score * score_gradient).sum(),
-                    arguments,
+                    reference_arguments,
                 )
                 for actual, expected in zip(actual_grad, expected_grad):
                     torch.testing.assert_close(actual, expected, rtol=1e-9, atol=1e-11)

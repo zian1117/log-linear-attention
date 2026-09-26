@@ -107,3 +107,47 @@ Duplicate periods are allowed; their gradient contributions are added.
     for period in periods:
         _validate(x, period)
     return _MultiActiveSelect.apply(x, periods)
+
+
+class _MultiActiveViews(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, periods):
+        ctx.input_shape = x.shape
+        ctx.input_dtype, ctx.input_device = x.dtype, x.device
+        ctx.periods = periods
+        ctx.set_materialize_grads(False)
+        source = x.contiguous()
+        batch, chunks = source.shape[:2]
+        tail = source.shape[2:]
+        return tuple(source.view(batch, chunks//p, p, *tail)[:, :, p//2:]
+                     .view(batch*(chunks//p), p//2, *tail) for p in periods)
+
+    @staticmethod
+    def backward(ctx, *gradients):
+        batch, chunks = ctx.input_shape[:2]
+        tail = ctx.input_shape[2:]
+        compact = tuple(None if gradient is None else
+                        gradient.contiguous().view(batch, chunks//2, *tail)
+                        for gradient in gradients)
+        # The shared adjoint still writes exactly one full input gradient.
+        return _MultiActiveSelect.backward(ctx, *compact)
+
+
+def multi_active_views(x, periods):
+    """Select complete active halves without copying their matrix payloads.
+
+Each output has [batch*(chunks/period), period/2, ...] axes and retains
+the gap between period groups. Consumers must support that grouped stride;
+flattening the first two axes would silently reintroduce a copy. Partial
+periods use multi_active_select instead. Duplicate/unused outputs are allowed.
+    """
+    periods = tuple(periods)
+    if x.ndim < 2 or min(x.shape[:2]) <= 0:
+        raise ValueError('Fenwick views expect nonempty [batch, chunks, ...].')
+    for period in periods:
+        _validate(x, period)
+        if period % 2 or x.shape[1] % period:
+            raise ValueError('Fenwick views require complete even periods.')
+    if not periods:
+        return ()
+    return _MultiActiveViews.apply(x, periods)

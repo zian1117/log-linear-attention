@@ -402,12 +402,17 @@ def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, ve
                 if repair_periods:
                     nonfinite.append(diagnostic[1])
         gathered, state_pairs = None, None
+        gathered_views = False
         if (shared_gathers or shared_states) and levels > local_levels:
             periods = tuple(1 << (level-(chunk.bit_length()-1))
                             for level in range(local_levels,levels))
             if shared_gathers:
-                from .multi_active_select import multi_active_select
-                gathered = tuple(multi_active_select(x,periods) for x in (rn,qn,k,beta,gc,u))
+                from .multi_active_select import multi_active_select, multi_active_views
+                # The mapped projected core consumes complete-period views.
+                # Other backends and partial periods retain compact gathers.
+                gathered_views = shared_states and all(nchunks % period == 0 for period in periods)
+                select = multi_active_views if gathered_views else multi_active_select
+                gathered = tuple(select(x,periods) for x in (rn,qn,k,beta,gc,u))
             if shared_states:
                 from .multi_projected_states import multi_projected_states
                 factor = beta*gc.exp().to(beta.dtype)
@@ -422,7 +427,7 @@ def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, ve
                 selected = None if gathered is None else tuple(x[level-local_levels] for x in gathered)
                 y,score,*diagnostic=projected_coarse(
                     *args,selected_inputs=selected,state_pair=state_pairs[level-local_levels],
-                    state_pair_active=True)
+                    state_pair_active=True,selected_inputs_grouped=gathered_views)
             elif gathered is None:
                 y,score,*diagnostic=_coarse(*args)
             else:
