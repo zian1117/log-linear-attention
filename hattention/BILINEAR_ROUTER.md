@@ -72,21 +72,29 @@ original Fenwick periods and their write halves are unchanged. Backward also
 reuses the guard's FP64 key-times-adjoint product, recomputing it for every
 period whose adjoint the guard replaces; no precision check is relaxed.
 
-The performance target is **not met**. In L40S job `23994713`, a matched
-attention-layer forward/backward at batch 4, context 16,384, 12 heads, key
-dimension 128 and value dimension 64 took **0.7535 s**, versus **0.4367 s**
-for the previous `single_probe` implementation (`e8fcd9f`): about 73% slower.
-Peak allocated GPU memory was **31.07 GB versus 13.75 GB** (decimal GB).
+The public boundary scan returns only the chunks in each Fenwick period's
+active half. Backward reads those compact direct gradients and supplies zero
+for the inactive positions internally, avoiding a dense gradient expansion
+at each level. Every preceding write and erase still participates in the
+state recurrence and receives its full gradient; complete boundary histories
+remain saved for parameter-gradient computation.
+
+The performance target is **not met**. Matched attention-layer forward/backward
+measurements use batch 4, context 16,384, 12 heads, key dimension 128 and value
+dimension 64, versus the previous `single_probe` implementation (`e8fcd9f`):
+
+| GPU / job | Bilinear layer | Reference layer | Ratio | Peak allocated memory, new / reference |
+| --- | ---: | ---: | ---: | ---: |
+| L40S / 23995148 | 0.7406 s | 0.4370 s | 1.69x | 31.07 / 13.75 GB |
+| H200 / 23995149 | 0.1990 s | 0.07353 s | 2.71x | 31.12 / 13.80 GB |
+
 These are warmed layer measurements with common parameters matched, using an
 initialized first layer and saved validation tokens; they are not complete
-training-step timings. Repair cost depends on the inputs. H200 job `23994151`,
-before the final normalization-cast correction and guard-product reuse,
-measured **0.2195 s versus 0.07624 s**, with **31.92 GB versus 13.80 GB**.
-The final-source H200 rerun (`23994765`) passed its compiled 16K correctness
-check (largest relative error `6.52e-7`) but was preempted during batch-4 timing;
-its queued restart was canceled. The earlier H200 timing above is explicitly
-not a measurement of the last two edits. Neither throughput parity nor the
-20% slowdown target has been established.
+training-step timings. Repair cost depends on the inputs. Neither throughput
+parity nor the 20% slowdown target has been established. Compact gradients
+remove redundant transfers, but did not lower the measured whole-layer peak
+allocation. Changing scan tile sizes did not improve the combined forward and
+backward scan totals at the measured batch sizes on these GPUs.
 
 Full-sequence training and evaluation support nonmultiple lengths and unequal
 key/value dimensions. Packed sequences and cached decoding are explicitly
@@ -103,6 +111,7 @@ python tests/test_adaptive_matrix_gdn.py
 python tests/test_cached_chunk_reads.py
 python tests/test_multi_active_select.py
 python tests/test_multi_projected_states.py
+python tests/test_compact_projected_states.py
 python tests/test_shared_precise_input_cache.py
 python tests/test_normalization_precision.py
 python tests/test_refined_projection_reuse.py
@@ -112,11 +121,14 @@ python tests/test_bilinear_model_integration.py
 
 Run these inside the repository's CUDA/FLA runtime.
 
-Validation on 2026-09-26: all 80 regression tests passed on L40S (job
-`23994713`). A separate fresh-process compiled public-path check at 16K
+Validation on 2026-09-26: all 81 regression tests passed on L40S (job
+`23995148`). A separate fresh-process compiled public-path check at 16K
 compared outputs and all eight input gradients after RMSNorm with the explicit
 precise backend; the largest relative L2 error per head was `7.87e-7`.
-Cold and warm results matched. The BF16 normalizer also passed a separate
+Cold and warm results matched. H200 job `23995149` also passed the compiled
+16K check, with largest relative error `6.52e-7`. Compact versus full boundary
+outputs and all five factor gradients are bit-identical in 20 test cases;
+an independent FP64 recurrence additionally checks the same results. The BF16 normalizer also passed a separate
 fresh-process eager/compiled test against FP64 gradients. The larger regression
 suite disables compilation for numerical isolation; it is not additional
 compiled coverage. These checks establish agreement on the tested inputs,

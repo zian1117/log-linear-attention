@@ -38,7 +38,8 @@ def _forward(KP, ZP, FP, UP, AP, HP, PP, N: tl.constexpr,
 @triton.jit
 def _adjoints(KP, ZP, FP, AP, DHP, DPP, AHP, DUP, DZHP,
               N: tl.constexpr, C: tl.constexpr, K: tl.constexpr,
-              V: tl.constexpr, PERIOD: tl.constexpr, BV: tl.constexpr):
+              V: tl.constexpr, PERIOD: tl.constexpr, BV: tl.constexpr,
+              COMPACT: tl.constexpr = False, ACTIVE: tl.constexpr = 0):
     bh, segment, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     kk, vv, tt = tl.arange(0, K), tile*BV + tl.arange(0, BV), tl.arange(0, C)
     adjoint = tl.full((K, BV), 0, tl.float32)
@@ -52,12 +53,20 @@ def _adjoints(KP, ZP, FP, AP, DHP, DPP, AHP, DUP, DZHP,
             du = tl.dot(key, adjoint, input_precision='tf32x3')
             tl.store(DUP+off*C*V+tt[:, None]*V+vv[None, :], du, vv[None, :] < V)
             factor = tl.load(FP+off*C+tt)
-            dp = tl.load(DPP+off*C*V+tt[:, None]*V+vv[None, :], vv[None, :] < V, 0)
+            if COMPACT:
+                grad_off = bh*ACTIVE+segment*(PERIOD-PERIOD//2)+i-PERIOD//2
+                has_direct = i >= PERIOD//2
+            else:
+                grad_off = off
+                has_direct = True
+            dp = tl.load(DPP+grad_off*C*V+tt[:, None]*V+vv[None, :],
+                         has_direct & (vv[None, :] < V), 0)
             combined = dp-factor[:, None]*du
             tl.store(DZHP+off*C*V+tt[:, None]*V+vv[None, :], combined, vv[None, :] < V)
             z = tl.load(ZP+off*C*K+tt[:, None]*K+kk[None, :])
             decay = tl.load(AP+off)
-            direct = tl.load(DHP+off*K*V+kk[:, None]*V+vv[None, :], vv[None, :] < V, 0)
+            direct = tl.load(DHP+grad_off*K*V+kk[:, None]*V+vv[None, :],
+                             has_direct & (vv[None, :] < V), 0)
             adjoint = decay*adjoint+tl.dot(tl.trans(z), combined, input_precision='tf32x3')+direct
 
 

@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from .projected_bucket_states import _forward, _adjoints
+from .fenwick_gather import _gather, _count
 
 
 @triton.jit
@@ -54,7 +55,7 @@ def _decay_gradient(STATE, ADJOINT, DA, WIDTH: tl.constexpr,
 
 class _MultiProjectedStates(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, k, z, factor, value, decay, periods):
+    def forward(ctx, k, z, factor, value, decay, periods, active_outputs):
         k, z, factor, value, decay = (x.contiguous() for x in (k,z,factor,value,decay))
         batch, chunks, chunk, key_dim = k.shape
         value_dim = value.shape[-1]
@@ -67,9 +68,11 @@ class _MultiProjectedStates(torch.autograd.Function):
                 period,32,num_warps=4,num_stages=1)
             states.append(state)
             projections.append(projected)
-            outputs.extend((state,projected))
+            outputs.extend((_gather(state,period),_gather(projected,period))
+                           if active_outputs else (state,projected))
         ctx.save_for_backward(k,z,factor,value,decay,*states,*projections)
         ctx.periods = periods
+        ctx.active_outputs = active_outputs
         ctx.set_materialize_grads(False)
         return tuple(outputs)
 
@@ -87,19 +90,22 @@ class _MultiProjectedStates(torch.autograd.Function):
         initial = True
         for index,period in enumerate(ctx.periods):
             direct, projection_gradient = gradients[2*index:2*index+2]
-            if direct is None and projection_gradient is None:
+            if ((direct is None or not direct.numel()) and
+                    (projection_gradient is None or not projection_gradient.numel())):
                 continue
+            active = _count(chunks,period) if ctx.active_outputs else chunks
             if direct is None:
-                if zero_state is None:
-                    zero_state = torch.zeros_like(adjoint)
+                if zero_state is None or zero_state.shape[1] != active:
+                    zero_state = k.new_zeros((batch,active,key_dim,value_dim))
                 direct = zero_state
             if projection_gradient is None:
-                if zero_projection is None:
-                    zero_projection = torch.zeros_like(value)
+                if zero_projection is None or zero_projection.shape[1] != active:
+                    zero_projection = value.new_zeros((batch,active,chunk,value_dim))
                 projection_gradient = zero_projection
             _adjoints[(batch,triton.cdiv(chunks,period),triton.cdiv(value_dim,32))](
                 k,z,factor,decay,direct.contiguous(),projection_gradient.contiguous(),
                 adjoint,du,combined,chunks,chunk,key_dim,value_dim,period,32,
+                ctx.active_outputs,active,
                 num_warps=4,num_stages=1)
             _residual_and_auxiliary[(triton.cdiv(factor.numel(),16),)](
                 value,projections[index],factor,du,residual,df,dv,chunks,chunk,value_dim,
@@ -122,15 +128,18 @@ class _MultiProjectedStates(torch.autograd.Function):
         if initial:
             for gradient in (dk,dz,df,dv,da):
                 gradient.zero_()
-        return dk,dz,df,dv,da,None
+        return dk,dz,df,dv,da,None,None
 
 
-def multi_projected_states(k,z,factor,value,decay,periods):
+def multi_projected_states(k,z,factor,value,decay,periods, *, active_outputs=False):
     """Return a tuple of (boundary states, z@state) pairs, one per period.
 
 Inputs match ProjectedStates: k/z [B,N,C,K], factor [B,N,C],
 value [B,N,C,V], decay [B,N]. Odd feature/chunk dimensions are padded
 internally for the unchanged tensor-core scan kernels.
+With active_outputs=True, return only second-half chunks of each period;
+backward reads their compact direct gradients without dense expansion. The
+complete prefix states and recurrent gradients are retained internally.
 """
     periods = tuple(periods)
     if not periods:
@@ -152,6 +161,6 @@ internally for the unchanged tensor-core scan kernels.
               F.pad(z,(0,kp,0,cp)) if kp or cp else z,
               F.pad(factor,(0,cp)) if cp else factor,
               F.pad(value,(0,vp,0,cp)) if vp or cp else value,decay)
-    flat = _MultiProjectedStates.apply(*inputs,periods)
+    flat = _MultiProjectedStates.apply(*inputs,periods,active_outputs)
     return tuple((flat[2*i][...,:key_dim,:value_dim],flat[2*i+1][...,:chunk,:value_dim])
                  for i in range(len(periods)))

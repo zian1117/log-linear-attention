@@ -35,7 +35,8 @@ _checkpoint_core = torch.compile(_core, fullgraph=True, dynamic=True)
 
 def projected_coarse(kn, wn, writes, end, rn, qn, k, beta, gc, u, temperature,
                      period, terms, mass_decay, mass_addition, floor, output_dtype,
-                     return_masks=False, selected_inputs=None, state_pair=None):
+                     return_masks=False, selected_inputs=None, state_pair=None,
+                     state_pair_active=False):
     key_dim,value_dim = k.shape[-1],writes.shape[-1]
     kp = max(16,triton.next_power_of_2(key_dim))-key_dim
     vp = max(16,triton.next_power_of_2(value_dim))-value_dim
@@ -50,7 +51,8 @@ def projected_coarse(kn, wn, writes, end, rn, qn, k, beta, gc, u, temperature,
     else:
         state,projected = state_pair
     chunks = k.shape[1]
-    state,projected = (active_select(x,period) for x in (state,projected))
+    if state_pair is None or not state_pair_active:
+        state,projected = (active_select(x,period) for x in (state,projected))
     rn,qn,k,beta,gc,u = (tuple(active_select(x,period) for x in (rn,qn,k,beta,gc,u))
                         if selected_inputs is None else selected_inputs)
     mass0 = active_select(boundary_mass(mass_decay,mass_addition,period),period)

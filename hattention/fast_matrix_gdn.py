@@ -395,7 +395,8 @@ def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, ve
             if shared_states:
                 from .multi_projected_states import multi_projected_states
                 factor = beta*gc.exp().to(beta.dtype)
-                state_pairs = multi_projected_states(kn,terms[3],factor,writes,end,periods)
+                state_pairs = multi_projected_states(kn,terms[3],factor,writes,end,periods,
+                                                    active_outputs=True)
         for level in range(local_levels,levels):
             period=1<<(level-(chunk.bit_length()-1))
             args=(kn,wn,writes,end,rn,qn,k,beta,gc,u,temperature,period,terms,
@@ -404,7 +405,8 @@ def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, ve
                 from .projected_coarse_router import projected_coarse
                 selected = None if gathered is None else tuple(x[level-local_levels] for x in gathered)
                 y,score,*diagnostic=projected_coarse(
-                    *args,selected_inputs=selected,state_pair=state_pairs[level-local_levels])
+                    *args,selected_inputs=selected,state_pair=state_pairs[level-local_levels],
+                    state_pair_active=True)
             elif gathered is None:
                 y,score,*diagnostic=_coarse(*args)
             else:
