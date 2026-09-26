@@ -10,7 +10,8 @@ from functools import lru_cache
 from types import FunctionType
 from torch.utils.checkpoint import checkpoint
 
-from .bilinear_matrix_gdn import _RoutingReduce, _CHUNK_SIZE, _gdn_normalize
+from .bilinear_matrix_gdn import _CHUNK_SIZE, _gdn_normalize
+from .tuple_routing_reduce import tuple_routing_reduce
 from .bucket_frobenius import _segment_blocks
 from .energy_bucket_norm import _local_energy, _high_energy
 from .fenwick_gather import active_select, active_scatter
@@ -429,6 +430,6 @@ def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, ve
                                   (r,k,v,beta,gc,u,q,temperature),norm_floor,output_dtype,
                                   repair_chunks=repair_chunks,compact_cache_reads=compact_cache_reads)
                    if repair_periods else torch.stack(flags).any(0))
-        out=_RoutingReduce.apply(torch.stack(ys,-2),torch.stack(scores,-1),key_dim**-.5)
+        out=tuple_routing_reduce(ys,scores,key_dim**-.5)
     return out.reshape(bsz,heads,nchunks,chunk,value_dim).permute(0,2,3,1,4).reshape(
         bsz,padded,heads,value_dim)[:,:length],flagged

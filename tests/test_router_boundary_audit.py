@@ -66,7 +66,7 @@ class TestRouterBoundaryAudit(unittest.TestCase):
                 actual_inputs = tuple(x.clone().requires_grad_() for x in raw)
                 expected_inputs = tuple(x.double().requires_grad_() for x in raw)
                 with mock.patch.object(self.fast._FloatStates, 'apply', period_tests.TestPeriodReplacementCPU.float_states), \
-                     mock.patch.object(self.fast._RoutingReduce, 'apply', period_tests.TestPeriodReplacementCPU.reduce):
+                     mock.patch.object(self.fast, 'tuple_routing_reduce', period_tests.TestPeriodReplacementCPU.tuple_reduce):
                     actual, flags = self.fast.fast_matrix_gdn(*actual_inputs, repair_periods=True)
                     self.assertFalse(flags.any())
                     expected = self.oracle.full_matrix_reference(

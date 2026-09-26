@@ -96,6 +96,11 @@ class TestPeriodReplacementCPU(unittest.TestCase):
         weight = logits.masked_fill(~active,-torch.inf).softmax(-1)
         return (weight[...,None]*values).sum(-2).mul(scale).to(values.dtype)
 
+    @staticmethod
+    def tuple_reduce(values, logits, scale):
+        return TestPeriodReplacementCPU.reduce(
+            torch.stack(values, -2), torch.stack(logits, -1), scale)
+
     def test_full_router_mixed_heads_all_eight_gradients(self):
         generator = torch.Generator().manual_seed(321)
         def randn(*shape): return torch.randn(*shape,generator=generator)
@@ -116,7 +121,7 @@ class TestPeriodReplacementCPU(unittest.TestCase):
             def replace(*args,**kwargs):
                 calls.append(args[2].numel())
                 return real_replace(*args,**kwargs)
-            with mock.patch.object(self.fast._FloatStates,'apply',self.float_states), mock.patch.object(self.fast._RoutingReduce,'apply',self.reduce), mock.patch.object(self.fast,'_replace_selected_periods',replace):
+            with mock.patch.object(self.fast._FloatStates,'apply',self.float_states), mock.patch.object(self.fast,'tuple_routing_reduce',self.tuple_reduce), mock.patch.object(self.fast,'_replace_selected_periods',replace):
                 actual,flagged=self.fast.fast_matrix_gdn(*actual_inputs,repair_periods=True)
                 self.assertFalse(flagged.any())
                 self.assertTrue(calls)
