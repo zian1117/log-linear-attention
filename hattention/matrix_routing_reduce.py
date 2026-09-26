@@ -7,7 +7,7 @@ import triton.language as tl
 @triton.jit
 def _reduce(Y,C,U,S,O,DO,DY,DC,DU,DS,
             T:tl.constexpr,L:tl.constexpr,V:tl.constexpr,LB:tl.constexpr,
-            BACKWARD:tl.constexpr,EPS:tl.constexpr):
+            BACKWARD:tl.constexpr,EPS:tl.constexpr,VALUE_SCALE:tl.constexpr):
     row=tl.program_id(0)
     bh=row//T
     t=row%T
@@ -31,10 +31,10 @@ def _reduce(Y,C,U,S,O,DO,DY,DC,DU,DS,
     weight=tl.exp(logits-tl.max(logits,0))
     weight=weight/tl.sum(weight,0)
     if not BACKWARD:
-        out=tl.sum(weight[:,None]*y,0)
+        out=tl.sum(weight[:,None]*y,0)*VALUE_SCALE
         tl.store(O+row*V+vv,out)
     else:
-        do=tl.load(DO+row*V+vv).to(tl.float32)
+        do=tl.load(DO+row*V+vv).to(tl.float32)*VALUE_SCALE
         da=tl.sum(y*do[None,:],1)
         dl=weight*(da-tl.sum(weight*da,0))
         dy=weight[:,None]*do[None,:]
@@ -50,12 +50,13 @@ def _reduce(Y,C,U,S,O,DO,DY,DC,DU,DS,
 
 class RoutingReduce(torch.autograd.Function):
     @staticmethod
-    def forward(ctx,values,keys,query,temperature):
+    def forward(ctx,values,keys,query,temperature,value_scale):
         values,keys,query,temperature=[x.contiguous() for x in (values,keys,query,temperature)]
         BH,N,C,L,V=values.shape
         out=torch.empty((BH,N,C,V),device=values.device,dtype=values.dtype)
-        _reduce[(BH*N*C,)](values,keys,query,temperature,out,None,None,None,None,None,N*C,L,V,triton.next_power_of_2(L),False,1e-6,num_warps=4)
+        _reduce[(BH*N*C,)](values,keys,query,temperature,out,None,None,None,None,None,N*C,L,V,triton.next_power_of_2(L),False,1e-6,value_scale,num_warps=4)
         ctx.save_for_backward(values,keys,query,temperature)
+        ctx.value_scale=value_scale
         return out
 
     @staticmethod
@@ -64,5 +65,5 @@ class RoutingReduce(torch.autograd.Function):
         BH,N,C,L,V=values.shape
         dy,dc,du=[torch.empty_like(x) for x in (values,keys,query)]
         ds=torch.empty((BH,N,C),device=values.device,dtype=torch.float32)
-        _reduce[(BH*N*C,)](values,keys,query,temperature,None,do.contiguous(),dy,dc,du,ds,N*C,L,V,triton.next_power_of_2(L),True,1e-6,num_warps=4)
-        return dy,dc,du,ds.sum((1,2)).reshape_as(temperature).to(temperature.dtype)
+        _reduce[(BH*N*C,)](values,keys,query,temperature,None,do.contiguous(),dy,dc,du,ds,N*C,L,V,triton.next_power_of_2(L),True,1e-6,ctx.value_scale,num_warps=4)
+        return dy,dc,du,ds.sum((1,2)).reshape_as(temperature).to(temperature.dtype),None

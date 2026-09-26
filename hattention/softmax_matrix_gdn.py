@@ -161,5 +161,7 @@ def softmax_matrix_gdn(q,k,v,g,beta,query,probe,log_temperature):
     keys=torch.stack(cs,-2)
     routed_query=chunks(query)
     temperature=log_temperature.float().unsqueeze(0).expand(B,-1).reshape(B*H,1,1,1)
-    out=RoutingReduce.apply(values,keys,routed_query,temperature)
+    # Match vanilla GDN's normalized-query read scale. Routing logits still
+    # use the unscaled bucket keys.
+    out=RoutingReduce.apply(values,keys,routed_query,temperature,K ** -0.5)
     return out.reshape(B,H,N,C,V).permute(0,2,3,1,4).reshape(B,T,H,V)
