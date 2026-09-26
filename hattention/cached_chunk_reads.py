@@ -160,7 +160,7 @@ def prepare_grouped_chunk_reads(k, selections, chunk_cache, read_input_cache):
 def cached_chunk_reads(r, k, beta, gc, u, q, temperature, level,
                        selected_periods, selected_chunks, chunk_cache, *,
                        norm_floor=1e-6, output_dtype=None, read_input_cache=None,
-                       history_chunks=None, prepared=None):
+                       history_chunks=None, prepared=None, boundary_state=None):
     """Return ``(flat_chunk_ids, y[J,C,V], score[J,C])`` for active requests.
 
     Inputs are already-normalized chunk vectors [BH,N,C,D], beta/gc[BH,N,C],
@@ -219,8 +219,15 @@ def cached_chunk_reads(r, k, beta, gc, u, q, temperature, level,
             rr, kk, bb, gg, uu, qq = (x.index_select(0, plan.read_ids) for x in read_input_cache[1:])
     # One correction is sufficient only when its measured residual passes the
     # same forward/reverse checks; rejected periods still use the FP64 scan.
-    state = (RefinedStates.apply(kn, wn, writes, end, plan.period_chunks, norm_floor, 1)
-             if k.is_cuda else BucketStates.apply(kn, wn, writes, end, plan.period_chunks))
+    if boundary_state is None:
+        state = (RefinedStates.apply(kn, wn, writes, end, plan.period_chunks, norm_floor, 1)
+                 if k.is_cuda else BucketStates.apply(kn, wn, writes, end, plan.period_chunks))
+    else:
+        expected_shape = (*kn.shape[:2], kn.shape[-1], writes.shape[-1])
+        if (boundary_state.shape != expected_shape or boundary_state.dtype != torch.float64
+                or boundary_state.device != kn.device):
+            raise ValueError('Prepared boundary state must match FP64 repair factors')
+        state = boundary_state
     state = state[plan.rows, plan.positions]
     norm2 = high_bucket_norm2(kk, bb, gg, state,
                              terms=(None, None, None, z), norm_floor=norm_floor)

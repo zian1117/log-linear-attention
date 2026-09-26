@@ -6,9 +6,8 @@ import triton.language as tl
 
 
 @triton.jit
-def _forward(KP, WP, UP, AP, HP, N: tl.constexpr, C: tl.constexpr,
+def _forward_one(bh, seg, tile, KP, WP, UP, AP, HP, N: tl.constexpr, C: tl.constexpr,
              K: tl.constexpr, V: tl.constexpr, P: tl.constexpr, BV: tl.constexpr):
-    bh, seg, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     kk, vv, tt = tl.arange(0, K), tile * BV + tl.arange(0, BV), tl.arange(0, C)
     state = tl.full((K, BV), 0, tl.float32)
     for i in range(P):
@@ -25,6 +24,12 @@ def _forward(KP, WP, UP, AP, HP, N: tl.constexpr, C: tl.constexpr,
                 residual = u - tl.dot(w, state, input_precision='tf32x3')
                 a = tl.load(AP + off)
                 state = a * state + tl.dot(tl.trans(key), residual, input_precision='tf32x3')
+
+
+@triton.jit
+def _forward(KP, WP, UP, AP, HP, N: tl.constexpr, C: tl.constexpr,
+             K: tl.constexpr, V: tl.constexpr, P: tl.constexpr, BV: tl.constexpr):
+    _forward_one(tl.program_id(0), tl.program_id(1), tl.program_id(2), KP, WP, UP, AP, HP, N, C, K, V, P, BV)
 
 
 @triton.jit
@@ -87,11 +92,10 @@ def state_gradients(k, w, value, decay, state, direct, period, value_tile=32, wa
 
 
 @triton.jit
-def _adjoints(KP, WP, AP, DHP, AHP, DUP,
+def _adjoints_one(bh, seg, tile, KP, WP, AP, DHP, AHP, DUP,
               N: tl.constexpr, C: tl.constexpr, K: tl.constexpr,
               V: tl.constexpr, P: tl.constexpr, BV: tl.constexpr,
               STORE_DU: tl.constexpr = True):
-    bh, seg, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     kk, vv, tt = tl.arange(0, K), tile*BV + tl.arange(0, BV), tl.arange(0, C)
     dh = tl.full((K, BV), 0, tl.float32)
     for reverse in range(P):
@@ -111,9 +115,16 @@ def _adjoints(KP, WP, AP, DHP, AHP, DUP,
 
 
 @triton.jit
-def _correction(KP, WP, AP, DP, HP, N: tl.constexpr, C: tl.constexpr,
+def _adjoints(KP, WP, AP, DHP, AHP, DUP,
+              N: tl.constexpr, C: tl.constexpr, K: tl.constexpr,
+              V: tl.constexpr, P: tl.constexpr, BV: tl.constexpr,
+              STORE_DU: tl.constexpr = True):
+    _adjoints_one(tl.program_id(0), tl.program_id(1), tl.program_id(2), KP, WP, AP, DHP, AHP, DUP, N, C, K, V, P, BV, STORE_DU)
+
+
+@triton.jit
+def _correction_one(bh, seg, tile, KP, WP, AP, DP, HP, N: tl.constexpr, C: tl.constexpr,
                 K: tl.constexpr, V: tl.constexpr, P: tl.constexpr, BV: tl.constexpr):
-    bh, seg, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     kk, vv, tt = tl.arange(0, K), tile*BV + tl.arange(0, BV), tl.arange(0, C)
     state = tl.full((K, BV), 0, tl.float32)
     for i in range(P):
@@ -128,6 +139,12 @@ def _correction(KP, WP, AP, DP, HP, N: tl.constexpr, C: tl.constexpr,
                 a = tl.load(AP+off)
                 defect = tl.load(DP+off*K*V + kk[:, None]*V + vv[None, :], vv[None, :] < V, 0)
                 state = a*state - tl.dot(tl.trans(key), projection, input_precision='tf32x3') + defect
+
+
+@triton.jit
+def _correction(KP, WP, AP, DP, HP, N: tl.constexpr, C: tl.constexpr,
+                K: tl.constexpr, V: tl.constexpr, P: tl.constexpr, BV: tl.constexpr):
+    _correction_one(tl.program_id(0), tl.program_id(1), tl.program_id(2), KP, WP, AP, DP, HP, N, C, K, V, P, BV)
 
 
 @torch.compile

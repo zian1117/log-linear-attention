@@ -5,7 +5,7 @@ from types import FunctionType
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from .bucket_frobenius import _segment_blocks
+from .joint_local_blocks import joint_blocks
 from .shared_local_norm import _shared_core as _shared_norm_core
 from .current_bucket_score import current_bucket_score, previous_bucket_score
 
@@ -17,6 +17,11 @@ def _all_local(ar, aq, k, v, beta, u, q, temperature, inverse, decay,
     from .fast_matrix_gdn import _score, _diagnostics
     torch._dynamo.mark_static(k,-2)
     chunk = k.shape[-2]
+    periods = tuple(1 << level for level in range(1, levels))
+    ar_blocks = joint_blocks(ar, periods)
+    aq_blocks = joint_blocks(aq, periods)
+    inverse_blocks = joint_blocks(inverse, periods)
+    decay_blocks_joint = joint_blocks(decay, periods)
     projections, residuals, decay_blocks = [], [], []
     with torch.no_grad():
         positive_mass = beta*k.norm(dim=-1)*v.norm(dim=-1)
@@ -25,10 +30,10 @@ def _all_local(ar, aq, k, v, beta, u, q, temperature, inverse, decay,
         half = period//2
         shape = (*beta.shape[:-1], chunk//period, period)
         value = v.reshape(*shape, v.shape[-1])[..., :half, :]
-        dr = _segment_blocks(ar,period)[..., half:, :half]
-        dq = _segment_blocks(aq,period)[..., half:, :half]
-        inv = _segment_blocks(inverse,period)
-        dec = _segment_blocks(decay,period).contiguous()
+        dr = ar_blocks[level-1][..., half:, :half]
+        dq = aq_blocks[level-1][..., half:, :half]
+        inv = inverse_blocks[level-1]
+        dec = decay_blocks_joint[level-1].contiguous()
         residual_coefficients = inv[..., half:, :half]*dec[..., half:, :half]
         if use_fused:
             from .local_bucket_projections import local_bucket_projections
@@ -38,7 +43,7 @@ def _all_local(ar, aq, k, v, beta, u, q, temperature, inverse, decay,
         projections.append((y,read))
         residuals.append(residual)
         decay_blocks.append(dec)
-    norm_result = _shared_norm_core(k,v,beta,inverse,decay,levels,tuple(residuals), return_metadata)
+    norm_result = _shared_norm_core(k,v,beta,inverse_blocks,decay_blocks_joint,levels,tuple(residuals), return_metadata)
     if return_metadata:
         norms, prefix_delta, write_flags = norm_result
     else:

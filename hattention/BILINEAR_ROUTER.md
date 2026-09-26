@@ -33,7 +33,7 @@ encoding. Routing probes are independent of the value-read query.
 
 The public `bilinear_matrix_gdn` uses the adaptive implementation; the equations
 above are unchanged. `precise_bilinear_matrix_gdn` remains the FP64 reference.
-The normal path uses FP32 matrix arithmetic, shared boundary states/projections,
+The normal path uses FP32 matrix inputs and accumulation, shared boundary states/projections,
 and fused local reads. Triangular factors and energy identities compute bucket
 norms without materializing a matrix at every token. Computational chunks have
 64 tokens, independently of the model's key/value dimensions. Cumulative log
@@ -85,6 +85,24 @@ per cache tensor. Duplicate indices and unused outputs remain supported. This
 removes repeated destination allocation and summation; it does not change the
 repair decisions or normalization.
 
+Local hierarchy views now use a joint adjoint: contributions to the shared
+inverse, decay, and read-coefficient matrices are accumulated in one kernel
+per input. The local checkpoint remains enabled, so this does not retain all
+local intermediates. Independent precise repair scans are also grouped into
+one launch per scan operation, with longer histories scheduled first. They
+share the original recurrence bodies and retain the original FP64 forward and
+reverse residual checks, complete-history fallback, and factor gradients.
+
+On Hopper GPUs, tree products and the nine chunk-preparation products use
+three BF16 components per FP32 operand. Six component products accumulate into
+separate FP32 leading/correction sums, combined once after the reduction.
+This is an approximation to the FP32 product, as is the previous TF32x3
+implementation; it does not provide an all-input relative-error guarantee.
+Other GPU architectures retain the previous arithmetic. CPU and FP64 precise
+preparation retain ordinary matrix multiplication, and no global matmul
+precision setting is changed. The custom product adjoint uses the same kernel
+for its two transposed products.
+
 Final softmax reduction reads each hierarchy level directly through a tuple
 of tensor pointers. It avoids packing all reads into another tensor and
 returns contiguous gradients for each level. Score centering remains FP64;
@@ -97,8 +115,8 @@ dimension 64, versus the previous `single_probe` implementation (`e8fcd9f`):
 
 | GPU / job | Bilinear layer | Reference layer | Ratio | Peak allocated memory, new / reference |
 | --- | ---: | ---: | ---: | ---: |
-| L40S / 24002788 | 0.6784 s | 0.4372 s | 1.55x | 27.75 / 13.75 GB |
-| H200 / 24002787 | 0.2050 s | 0.08011 s | 2.56x | 27.79 / 13.80 GB |
+| L40S / 24006321 | 0.6562 s | 0.4371 s | 1.50x | 27.75 / 13.75 GB |
+| H100 NVL / 24006322 | 0.2100 s | 0.08544 s | 2.46x | 27.79 / 13.80 GB |
 
 These are warmed layer measurements with common parameters matched, using an
 initialized first layer and saved validation tokens; they are not complete
@@ -144,6 +162,9 @@ python tests/test_repair_prefix.py
 python tests/test_bilinear_model_integration.py
 python tests/test_radial_metadata.py
 python tests/test_radial_routing_precision.py
+python tests/test_joint_local_blocks.py
+python tests/test_grouped_refined_scans.py
+python tests/test_preparation_product.py
 ```
 
 Run these inside the repository's CUDA/FLA runtime.
@@ -186,7 +207,8 @@ integration regressions also passed. Model lifecycle tests were unchanged
 and passed on the preceding grouped-cache implementation.
 
 The first native-PyTorch affine-tree prototype was slower than the scan.
-The selected implementation instead uses TF32x3 matrix kernels, fused output
+The selected implementation instead uses tensor-core matrix kernels (TF32x3,
+or split BF16 expansion on Hopper), fused output
 operations, and a joint analytical backward. Its tests include independent
 FP64 state/gradient references, duplicate and unused outputs, arbitrary feature
 dimensions, and preservation of the original fallback scan.
@@ -332,3 +354,25 @@ additional time on H200 (0.18539 to 0.19170 s) and 3.49% on L40S (0.63553 to
 a supported deployment mode. These operator timings exclude model projections
 and should not be substituted for the full-layer timings above. The requested
 full-layer performance target remains unmet.
+
+Additional review of softmax/readout backward, temperature handling, decay
+exponentials, normalization casts, and rejected-head gradient isolation found
+no new consequential defect. Existing cancellation, tiny-value, BF16, masking
+and nonfinite-head regressions cover these paths. This is a bounded audit,
+not a guarantee for arbitrary trained states or alternate matmul settings.
+
+Applied optimization validation (jobs `24006321`, L40S, and `24006322`,
+H100 NVL): both completed with exit code zero. Seventeen helper tests cover
+independent state recurrences and product adjoints, partial histories, strided
+inputs, unused outputs, and checkpoint recomputation. Nine radial-gradient
+fixtures, ten additional public stress cases, the compiled 16K FP32/native
+BF16 comparisons, and all eight model lifecycle tests passed. Source hashes
+were unchanged across all stages and verified against the committed files.
+
+The largest per-head relative L2 discrepancy among the 16K output and eight
+input gradients was `1.14e-6` on L40S and `2.77e-6` on H100 NVL for FP32 inputs.
+For native BF16 inputs the maxima were `0.0003002` and `0.0002944`. Here relative
+L2 discrepancy means `||actual-reference||_2 / ||reference||_2`, measured
+separately per head against the retained precise backend. These figures concern
+these test inputs, not the eventual trained model. The current layer timing
+is reported in the table above; the performance goal remains unmet.

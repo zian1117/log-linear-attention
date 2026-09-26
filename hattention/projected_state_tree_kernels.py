@@ -1,4 +1,8 @@
-"""Private FP32 TF32x3 products for the shared projected-state tree.
+"""Private FP32 tensor-core products for the shared projected-state tree.
+
+Hopper uses a six-product BF16 expansion with separate leading/correction
+accumulators. Other devices retain TF32x3. Neither is exact FP32 multiplication;
+conditioning checks and precise repairs remain in the caller.
 
 Two kernels cover plain/accumulating products and diagonal/interleaved forward
 epilogues. They preserve the validated 64x64x32 reduction order and disable
@@ -10,6 +14,35 @@ import torch
 import triton
 import triton.language as tl
 
+
+def _use_split_bf16(device):
+    # Validated speed benefit on Hopper; other architectures retain TF32x3.
+    return torch.cuda.get_device_capability(device)[0] == 9
+
+@triton.jit
+def _bf16_expansion_dot(a, b, high, low):
+    # Three BF16 components cover each FP32 significand. Keep all terms
+    # through second-order residual products; omitted terms are O(2^-24)
+    # relative before accumulation, not an exact FP32 arithmetic claim.
+    ah = a.to(tl.bfloat16)
+    bh = b.to(tl.bfloat16)
+    ar = a-ah.to(tl.float32)
+    br = b-bh.to(tl.float32)
+    am = ar.to(tl.bfloat16)
+    bm = br.to(tl.bfloat16)
+    al = (ar-am.to(tl.float32)).to(tl.bfloat16)
+    bl = (br-bm.to(tl.float32)).to(tl.bfloat16)
+    # Keep corrections separate from the leading product across K tiles.
+    # Otherwise each tiny correction is repeatedly rounded into a large sum.
+    low = tl.dot(al, bh, low)
+    low = tl.dot(am, bm, low)
+    low = tl.dot(ah, bl, low)
+    low = tl.dot(am, bh, low)
+    low = tl.dot(ah, bm, low)
+    high = tl.dot(ah, bh, high)
+    return high, low
+
+
 @triton.jit
 def _bmm4_epilogue(A,B,ADD,OUT,M:tl.constexpr,N:tl.constexpr,K:tl.constexpr,
                   BATCH_N:tl.constexpr,
@@ -18,20 +51,27 @@ def _bmm4_epilogue(A,B,ADD,OUT,M:tl.constexpr,N:tl.constexpr,K:tl.constexpr,
                   C0:tl.constexpr,C1:tl.constexpr,C2:tl.constexpr,C3:tl.constexpr,
                   O0:tl.constexpr,O1:tl.constexpr,O2:tl.constexpr,O3:tl.constexpr,
                   ALPHA:tl.constexpr,BETA:tl.constexpr,
-                  BM:tl.constexpr=64,BN:tl.constexpr=64,BK:tl.constexpr=32):
+                  BM:tl.constexpr=64,BN:tl.constexpr=64,BK:tl.constexpr=32,
+                  SPLIT_BF16:tl.constexpr=False):
     tile,batch=tl.program_id(0),tl.program_id(1)
     row=(tile//tl.cdiv(N,BN))*BM+tl.arange(0,BM)
     col=(tile%tl.cdiv(N,BN))*BN+tl.arange(0,BN)
     kk0=tl.arange(0,BK)
     bh,bb=batch//BATCH_N,batch%BATCH_N
     acc=tl.full((BM,BN),0,tl.float32)
+    correction=tl.full((BM,BN),0,tl.float32)
     for block in range(tl.cdiv(K,BK)):
         kk=block*BK+kk0
         av=tl.load(A+bh*A0+bb*A1+row[:,None]*A2+kk[None,:]*A3,
                    (row[:,None]<M)&(kk[None,:]<K),0)
         bv=tl.load(B+bh*B0+bb*B1+kk[:,None]*B2+col[None,:]*B3,
                    (kk[:,None]<K)&(col[None,:]<N),0)
-        acc=tl.dot(av,bv,acc,input_precision='tf32x3')
+        if SPLIT_BF16:
+            acc,correction=_bf16_expansion_dot(av,bv,acc,correction)
+        else:
+            acc=tl.dot(av,bv,acc,input_precision='tf32x3')
+    if SPLIT_BF16:
+        acc=acc+correction
     result=acc*ALPHA
     valid=(row[:,None]<M)&(col[None,:]<N)
     if BETA!=0:
@@ -46,20 +86,27 @@ def _forward_epilogue(A,B,D,Y,M:tl.constexpr,N:tl.constexpr,K:tl.constexpr,
                       B0:tl.constexpr,B1:tl.constexpr,B2:tl.constexpr,B3:tl.constexpr,
                       D0:tl.constexpr,D1:tl.constexpr,
                       INTERLEAVE:tl.constexpr,
-                      BM:tl.constexpr=64,BN:tl.constexpr=64,BK:tl.constexpr=32):
+                      BM:tl.constexpr=64,BN:tl.constexpr=64,BK:tl.constexpr=32,
+                  SPLIT_BF16:tl.constexpr=False):
     tile,batch=tl.program_id(0),tl.program_id(1)
     row=(tile//tl.cdiv(N,BN))*BM+tl.arange(0,BM)
     col=(tile%tl.cdiv(N,BN))*BN+tl.arange(0,BN)
     bh,bb=batch//BATCH_N,batch%BATCH_N
     inner=tl.arange(0,BK)
     acc=tl.full((BM,BN),0,tl.float32)
+    correction=tl.full((BM,BN),0,tl.float32)
     for block in range(tl.cdiv(K,BK)):
         kk=block*BK+inner
         a=tl.load(A+bh*A0+bb*A1+row[:,None]*A2+kk[None,:]*A3,
                   (row[:,None]<M)&(kk[None,:]<K),0)
         b=tl.load(B+bh*B0+bb*B1+kk[:,None]*B2+col[None,:]*B3,
                   (kk[:,None]<K)&(col[None,:]<N),0)
-        acc=tl.dot(a,b,acc,input_precision='tf32x3')
+        if SPLIT_BF16:
+            acc,correction=_bf16_expansion_dot(a,b,acc,correction)
+        else:
+            acc=tl.dot(a,b,acc,input_precision='tf32x3')
+    if SPLIT_BF16:
+        acc=acc+correction
     valid=(row[:,None]<M)&(col[None,:]<N)
     offset=row[:,None]*N+col[None,:]
     if INTERLEAVE:
@@ -104,7 +151,8 @@ def bmm_add(a,b,addend,*,out=None,alpha=1.,beta=1.):
     if bh and nb:
         _bmm4_epilogue[(triton.cdiv(m,64)*triton.cdiv(n,64),bh*nb)](
             a,b,addend,out,m,n,k,nb,*a.stride(),*b.stride(),*addend.stride(),*out.stride(),
-            float(alpha),float(beta),num_warps=4,num_stages=2,enable_fp_fusion=False)
+            float(alpha),float(beta),SPLIT_BF16=_use_split_bf16(a.device),
+            num_warps=4,num_stages=2,enable_fp_fusion=False)
     return out
 
 def bmm_accumulate(a,b,out,*,alpha=1.,beta=1.):
@@ -126,6 +174,7 @@ def diagonal_bmm(a,b,decay):
     if bh and nb:
         _forward_epilogue[(triton.cdiv(m,64)*triton.cdiv(n,64),bh*nb)](
             a,b,decay,out,m,n,k,nb,*a.stride(),*b.stride(),*decay.stride(),False,
+            SPLIT_BF16=_use_split_bf16(a.device),
             num_warps=4,num_stages=2,enable_fp_fusion=False)
     return out
 
@@ -139,6 +188,7 @@ def interleaved_bmm(a,incoming):
     if bh and nb:
         _forward_epilogue[(triton.cdiv(m,64)*triton.cdiv(n,64),bh*nb)](
             a,incoming,incoming,out,m,n,k,nb,*a.stride(),*incoming.stride(),0,0,True,
+            SPLIT_BF16=_use_split_bf16(a.device),
             num_warps=4,num_stages=2,enable_fp_fusion=False)
     return out
 
@@ -156,5 +206,6 @@ def mm(a, b):
     if bh and nb:
         _bmm4_epilogue[(triton.cdiv(m,64)*triton.cdiv(n,64),bh*nb)](
             a,b,out,out,m,n,k,nb,*a.stride(),*b.stride(),*out.stride(),*out.stride(),
-            1.,0.,num_warps=4,num_stages=2,enable_fp_fusion=False)
+            1.,0.,SPLIT_BF16=_use_split_bf16(a.device),
+            num_warps=4,num_stages=2,enable_fp_fusion=False)
     return out

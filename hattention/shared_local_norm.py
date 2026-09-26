@@ -38,8 +38,12 @@ def _shared_core(k, v, beta, inverse, decay, levels, active_residuals, return_me
         preceding = value + delta
         # Materialize block layouts so dynamic batch sizes do not expose
         # symbolic diagonal strides to Inductor's CUDA matrix codegen.
-        inv_block = _segment_blocks(inverse, period).contiguous()
-        decay_block = _segment_blocks(decay, period).contiguous()
+        # The joint router supplies block views whose adjoints merge once.
+        # Standalone callers retain the ordinary tensor-factor interface.
+        inv_block = (inverse[level - 1] if isinstance(inverse, tuple)
+                     else _segment_blocks(inverse, period)).contiguous()
+        decay_block = (decay[level - 1] if isinstance(decay, tuple)
+                       else _segment_blocks(decay, period)).contiguous()
         # The full period-by-period norm product would redundantly reconstruct
         # the first-half residuals already represented by lower levels.
         if active_residuals is None:

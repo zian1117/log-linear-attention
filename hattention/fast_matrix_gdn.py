@@ -12,6 +12,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .bilinear_matrix_gdn import _CHUNK_SIZE, _gdn_normalize
 from .tuple_routing_reduce import tuple_routing_reduce
+from .preparation_product import preparation_product
 from .current_bucket_score import current_bucket_score, previous_bucket_score
 from .bucket_frobenius import _segment_blocks
 from .energy_bucket_norm import _local_energy, _high_energy
@@ -52,26 +53,26 @@ class _FloatStates(torch.autograd.Function):
 @torch.compile
 def _prepare(r, k, v, beta, gc, q, omit_weighted_keys=False):
     c = k.shape[-2]
-    gram = k @ k.transpose(-1, -2)
+    gram = preparation_product(k, k.transpose(-1, -2))
     eye = torch.eye(c, device=k.device, dtype=k.dtype)
     system = eye + (gram * beta.unsqueeze(-2)).tril(-1)
     inverse = torch.linalg.solve_triangular(system, eye.expand_as(system), upper=False, unitriangular=True)
     causal = torch.ones((c, c), device=k.device, dtype=torch.bool).tril()
-    decay = (gc.unsqueeze(-1)-gc.unsqueeze(-2)).masked_fill(~causal, -torch.inf).exp().to(k.dtype)
-    z = inverse @ k
+    decay = (gc.unsqueeze(-1) - gc.unsqueeze(-2)).masked_fill(~causal, -torch.inf).exp().to(k.dtype)
+    z = preparation_product(inverse, k)
     w = beta.unsqueeze(-1) * z
-    writes = beta.unsqueeze(-1) * ((inverse * decay) @ v)
-    rk = (r @ k.transpose(-1, -2)).tril()
-    qk = (q @ k.transpose(-1, -2)).tril()
-    ar = ((rk * beta.unsqueeze(-2)) @ inverse) * decay
-    aq = ((qk * beta.unsqueeze(-2)) @ inverse) * decay
+    writes = beta.unsqueeze(-1) * preparation_product(inverse * decay, v)
+    rk = preparation_product(r, k.transpose(-1, -2)).tril()
+    qk = preparation_product(q, k.transpose(-1, -2)).tril()
+    ar = preparation_product(rk * beta.unsqueeze(-2), inverse) * decay
+    aq = preparation_product(qk * beta.unsqueeze(-2), inverse) * decay
     gain = gc.exp().to(k.dtype).unsqueeze(-1)
-    rn = gain * (r-rk @ w)
-    qn = gain * (q-qk @ w)
-    kn = k * (gc[..., -1:]-gc).exp().to(k.dtype).unsqueeze(-1)
+    rn = gain * (r - preparation_product(rk, w))
+    qn = gain * (q - preparation_product(qk, w))
+    kn = k * (gc[..., -1:] - gc).exp().to(k.dtype).unsqueeze(-1)
     wn = None if omit_weighted_keys else w * gain
     end = gc[..., -1].exp().to(k.dtype).contiguous()
-    return kn, wn, writes, end, rn, qn, ar, aq, (gram, inverse, decay, z)
+    return (kn, wn, writes, end, rn, qn, ar, aq, (gram, inverse, decay, z))
 
 
 def _score(read, u, norm2, temperature, floor):
@@ -297,6 +298,7 @@ def _repair_periods(ys, scores, masks, nonfinite, inputs, floor, output_dtype,
     chunk_cache = None
     read_input_cache = None
     prepared_reads = None
+    prepared_states = {}
     if repair_chunks:
         if any(needed[coarse_start:]):
             from .precise_period_reads import prepare_precise_chunk_cache
@@ -326,6 +328,14 @@ def _repair_periods(ys, scores, masks, nonfinite, inputs, floor, output_dtype,
                 )
                 prepared_reads = prepare_grouped_chunk_reads(
                     k, selections, chunk_cache, read_input_cache)
+                from .grouped_refined_scans import grouped_refined_states
+                state_levels = tuple(level for level, prepared in prepared_reads.items()
+                                     if prepared.plan.chunk_ids.numel() and k.is_cuda)
+                if state_levels:
+                    factors = tuple(prepared_reads[level].tensors[:4] for level in state_levels)
+                    periods = tuple(prepared_reads[level].plan.period_chunks for level in state_levels)
+                    prepared_states = dict(zip(state_levels, grouped_refined_states(
+                        factors, periods, norm_floor=floor, refinements=1)))
     for level, selected in enumerate(period_masks):
         if needed[level]:
             if repair_chunks and (1 << level) > inputs[1].shape[-2]:
@@ -339,7 +349,8 @@ def _repair_periods(ys, scores, masks, nonfinite, inputs, floor, output_dtype,
                         chunk_cache,norm_floor=floor,output_dtype=output_dtype,
                         read_input_cache=read_input_cache,
                         history_chunks=history_chunks[level],
-                        prepared=prepared_reads[level])
+                        prepared=prepared_reads[level],
+                        boundary_state=prepared_states.get(level))
                 else:
                     ids, y, score = precise_period_reads(
                         *inputs, level, selected, norm_floor=floor,
