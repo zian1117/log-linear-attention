@@ -77,7 +77,11 @@ active half. Backward reads those compact direct gradients and supplies zero
 for the inactive positions internally, avoiding a dense gradient expansion
 at each level. Every preceding write and erase still participates in the
 state recurrence and receives its full gradient; complete boundary histories
-remain saved for parameter-gradient computation.
+remain saved for parameter-gradient computation. Precise cache rows are gathered
+across repair levels together, so backward accumulates into one FP64 destination
+per cache tensor. Duplicate indices and unused outputs remain supported. This
+removes repeated destination allocation and summation; it does not change the
+repair decisions or normalization.
 
 The performance target is **not met**. Matched attention-layer forward/backward
 measurements use batch 4, context 16,384, 12 heads, key dimension 128 and value
@@ -85,8 +89,8 @@ dimension 64, versus the previous `single_probe` implementation (`e8fcd9f`):
 
 | GPU / job | Bilinear layer | Reference layer | Ratio | Peak allocated memory, new / reference |
 | --- | ---: | ---: | ---: | ---: |
-| L40S / 23995148 | 0.7406 s | 0.4370 s | 1.69x | 31.07 / 13.75 GB |
-| H200 / 23995149 | 0.1990 s | 0.07353 s | 2.71x | 31.12 / 13.80 GB |
+| L40S / 23996532 | 0.7208 s | 0.4372 s | 1.65x | 31.09 / 13.75 GB |
+| H200 / 23996531 | 0.1939 s | 0.07322 s | 2.65x | 31.12 / 13.80 GB |
 
 These are warmed layer measurements with common parameters matched, using an
 initialized first layer and saved validation tokens; they are not complete
@@ -94,7 +98,12 @@ training-step timings. Repair cost depends on the inputs. Neither throughput
 parity nor the 20% slowdown target has been established. Compact gradients
 remove redundant transfers, but did not lower the measured whole-layer peak
 allocation. Changing scan tile sizes did not improve the combined forward and
-backward scan totals at the measured batch sizes on these GPUs.
+backward scan totals at the measured batch sizes on these GPUs. A separate
+unsafe diagnostic disabled all repairs while retaining the current fast-path
+computation and diagnostics: H200 job `23996870` measured 0.1365 s versus
+0.07344 s. Thus removing repair cost alone would still miss the target in
+this implementation. This diagnostic is not a supported model mode or a
+mathematical lower bound on achievable runtime.
 
 Full-sequence training and evaluation support nonmultiple lengths and unequal
 key/value dimensions. Packed sequences and cached decoding are explicitly
@@ -113,6 +122,8 @@ python tests/test_multi_active_select.py
 python tests/test_multi_projected_states.py
 python tests/test_compact_projected_states.py
 python tests/test_shared_precise_input_cache.py
+python tests/test_multi_cache_gather.py
+python tests/test_grouped_cache_orchestration.py
 python tests/test_normalization_precision.py
 python tests/test_refined_projection_reuse.py
 python tests/test_repair_prefix.py
@@ -133,3 +144,17 @@ fresh-process eager/compiled test against FP64 gradients. The larger regression
 suite disables compilation for numerical isolation; it is not additional
 compiled coverage. These checks establish agreement on the tested inputs,
 not a prediction of final trained quality.
+
+Grouped-cache validation: H200 `23996531` and L40S `23996532` passed the
+new helper checks, shared-input/prefix/normalization regressions, and all model
+lifecycle checks. Grouped versus separate cache gathers preserve every raw
+input gradient against the independent recurrence, including cancellation,
+partial histories and unused selections. Frozen-source compiled 16K checks
+retain the above FP32 error bounds and identical cold/warm results.
+
+An additional audit retained the captured native BF16 input/output dtypes,
+using FP32 RMSNorm for the diagnostic loss. The largest per-head gradient
+relative L2 difference against the precise backend was 0.000292 on H200 and
+0.000322 on L40S, both in write-key gradients; output errors were below
+0.000060. These are separate native-dtype measurements, not a relaxation of
+the strict FP32 comparison. They do not establish trained-model quality.

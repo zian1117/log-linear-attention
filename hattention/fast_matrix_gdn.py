@@ -290,6 +290,7 @@ def _repair_periods(ys, scores, masks, nonfinite, inputs, floor, output_dtype,
         needed = torch.stack([x.any() for x in period_masks]).tolist()
     chunk_cache = None
     read_input_cache = None
+    prepared_reads = None
     if repair_chunks:
         if any(needed[coarse_start:]):
             from .precise_period_reads import prepare_precise_chunk_cache
@@ -306,11 +307,19 @@ def _repair_periods(ys, scores, masks, nonfinite, inputs, floor, output_dtype,
             chunk_cache = prepare_precise_chunk_cache(
                 inputs[1], inputs[2], inputs[3], inputs[4], required)
             if compact_cache_reads:
-                from .cached_chunk_reads import prepare_precise_read_input_cache
+                from .cached_chunk_reads import (
+                    prepare_precise_read_input_cache, prepare_grouped_chunk_reads,
+                )
                 r, k, _, beta, gc, u, q, _ = inputs
                 required_reads = torch.stack(tuple(read_masks.values())).any(0)
                 read_input_cache = prepare_precise_read_input_cache(
                     r, k, beta, gc, u, q, required_reads, chunk_cache=chunk_cache)
+                selections = tuple(
+                    (level, period_masks[level], read_masks[level], history_chunks[level])
+                    for level in range(coarse_start, len(masks)) if needed[level]
+                )
+                prepared_reads = prepare_grouped_chunk_reads(
+                    k, selections, chunk_cache, read_input_cache)
     for level, selected in enumerate(period_masks):
         if needed[level]:
             if repair_chunks and (1 << level) > inputs[1].shape[-2]:
@@ -323,7 +332,8 @@ def _repair_periods(ys, scores, masks, nonfinite, inputs, floor, output_dtype,
                         r,k,beta,gc,u,q,temperature,level,selected,selected_chunks,
                         chunk_cache,norm_floor=floor,output_dtype=output_dtype,
                         read_input_cache=read_input_cache,
-                        history_chunks=history_chunks[level])
+                        history_chunks=history_chunks[level],
+                        prepared=prepared_reads[level])
                 else:
                     ids, y, score = precise_period_reads(
                         *inputs, level, selected, norm_floor=floor,
