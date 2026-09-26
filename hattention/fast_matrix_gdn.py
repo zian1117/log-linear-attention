@@ -13,6 +13,7 @@ from torch.utils.checkpoint import checkpoint
 from .bilinear_matrix_gdn import _CHUNK_SIZE, _gdn_normalize
 from .tuple_routing_reduce import tuple_routing_reduce
 from .preparation_product import preparation_product
+from .normalized_chunks import normalized_chunks
 from .current_bucket_score import current_bucket_score, previous_bucket_score
 from .bucket_frobenius import _segment_blocks
 from .energy_bucket_norm import _local_energy, _high_energy
@@ -387,10 +388,11 @@ def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, ve
         return x.reshape(bsz,nchunks,chunk,heads,*x.shape[3:]).movedim(3,1).reshape(
             bsz*heads,nchunks,chunk,*x.shape[3:]).contiguous()
     with torch.autocast('cuda',enabled=False):
-        r,k=_gdn_normalize(r),_gdn_normalize(k)
-        u=F.normalize(u.float(),dim=-1,eps=vector_eps)
-        q=F.normalize(q.float(),dim=-1,eps=vector_eps)
-        r,k,v,u,q=map(chunks,(r,k,v,u,q))
+        r=normalized_chunks(r,chunk,'gdn',1e-6)
+        k=normalized_chunks(k,chunk,'gdn',1e-6)
+        u=normalized_chunks(u,chunk,'l2',vector_eps)
+        q=normalized_chunks(q,chunk,'l2',vector_eps)
+        v=chunks(v)
         beta=chunks(beta)
         # Keep scalar prefix sums/differences accurate even after a large
         # negative decay. Matrix products remain FP32.

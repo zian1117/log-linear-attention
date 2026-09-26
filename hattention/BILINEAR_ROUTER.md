@@ -65,6 +65,13 @@ almost-radial upstream-gradient regression, error against FP64 fell from
 bitwise unchanged. This is a controlled regression, not a measurement of
 training-gradient error across the model.
 
+The four input-vector normalizations compile their existing Torch expressions
+and chunk layout together. Outputs and shared gradient joins remain FP32;
+GDN's additive epsilon and the routing vectors' floored L2 convention are
+unchanged. Native autograd retains the derivative at the floor and the radial
+component of the additive-epsilon normalization. Values, gates, log decays,
+precision repair, and checkpoint parameters are unaffected.
+
 Repair reads also share gathered inputs across hierarchy levels. State scans
 stop after the last requested read, rounded up to a computational scheduling
 quantum. Every requested read retains all preceding writes and erasures; the
@@ -115,8 +122,8 @@ dimension 64, versus the previous `single_probe` implementation (`e8fcd9f`):
 
 | GPU / job | Bilinear layer | Reference layer | Ratio | Peak allocated memory, new / reference |
 | --- | ---: | ---: | ---: | ---: |
-| L40S / 24006321 | 0.6562 s | 0.4371 s | 1.50x | 27.75 / 13.75 GB |
-| H100 NVL / 24006322 | 0.2100 s | 0.08544 s | 2.46x | 27.79 / 13.80 GB |
+| L40S / 24008218 | 0.6169 s | 0.4371 s | 1.41x | 27.04 / 13.75 GB |
+| H100 80GB HBM3 / 24008217 | 0.1847 s | 0.08488 s | 2.18x | 27.07 / 13.80 GB |
 
 These are warmed layer measurements with common parameters matched, using an
 initialized first layer and saved validation tokens; they are not complete
@@ -376,3 +383,22 @@ L2 discrepancy means `||actual-reference||_2 / ||reference||_2`, measured
 separately per head against the retained precise backend. These figures concern
 these test inputs, not the eventual trained model. The current layer timing
 is reported in the table above; the performance goal remains unmet.
+
+Applied normalization validation (H100 80GB HBM3 `24008217`, L40S `24008218`)
+completed with exit code zero and verified unchanged source hashes. All 22
+helper tests, nine radial-gradient fixtures, ten public stress cases, compiled
+16K FP32/native BF16 comparisons, and eight model lifecycle tests passed. The
+new normalization tests cover zero vectors, exact floor equality and its two
+sides, additive epsilon, nearly radial BF16 gradients against an independent
+FP64 oracle, shared mixed-precision consumers, padded/strided layouts, and
+checkpoint replay. No tolerances were relaxed.
+
+Maximum per-head relative L2 discrepancies across the output and all eight
+input gradients were `3.07e-6` (H100) and `1.26e-6` (L40S) for FP32 inputs;
+native BF16 maxima were `0.0002643` and `0.0002964`. Cold and warm comparisons
+matched exactly. Current matched layer times are in the table above; these
+are attention-layer measurements, not full-model training-step throughput.
+
+A separate implicit-tree fusion was rejected: although its isolated leaf
+operation improved on L40S, the complete tree took 118.60 ms versus the retained
+implementation's 104.19 ms. The production tree is unchanged.
