@@ -81,6 +81,9 @@ class PreciseChunkCache(NamedTuple):
     writes: torch.Tensor
     end: torch.Tensor
     z: torch.Tensor
+    raw_k: torch.Tensor
+    raw_beta: torch.Tensor
+    raw_gc: torch.Tensor
 
 
 def prepare_precise_chunk_cache(k, v, beta, gc, needed_chunks):
@@ -99,18 +102,21 @@ def prepare_precise_chunk_cache(k, v, beta, gc, needed_chunks):
     heads, chunks = needed_chunks.nonzero(as_tuple=True)
     lookup = torch.full(k.shape[:2], -1, device=k.device, dtype=torch.long)
     lookup[heads, chunks] = torch.arange(1, heads.numel() + 1, device=k.device)
+    # Share the FP64 nodes between state preparation and subsequent reads.
+    # Independently promoting the same FP32 input would round their large,
+    # cancelling gradients separately before they meet at that input.
+    kk, vv, bb, gg = (x[heads, chunks].double() for x in (k, v, beta, gc))
     if heads.numel():
-        factors = _coarse_state_factors(*(x[heads, chunks].double() for x in (k, v, beta, gc)))
+        factors = _coarse_state_factors(kk, vv, bb, gg)
     else:
-        key_empty = k.new_empty((0, *k.shape[2:]), dtype=torch.float64)
-        value_empty = v.new_empty((0, *v.shape[2:]), dtype=torch.float64)
-        end_empty = gc.new_empty((0,), dtype=torch.float64)
-        factors = (key_empty, key_empty, value_empty, end_empty, key_empty)
+        factors = (kk, kk, vv, gg.new_empty((0,)), kk)
     # Identity padding exactly matches preparing a zero key/value/beta chunk
     # with zero cumulative decay. Concatenation preserves all real gradients.
     padded = tuple(torch.cat((x.new_full((1, *x.shape[1:]), 1. if index == 3 else 0.), x), dim=0)
                    for index, x in enumerate(factors))
-    return PreciseChunkCache(lookup, *padded)
+    raw = tuple(torch.cat((x.new_zeros((1, *x.shape[1:])), x), dim=0)
+                for x in (kk, bb, gg))
+    return PreciseChunkCache(lookup, *padded, *raw)
 
 
 def precise_period_reads(r, k, v, beta, gc, u, q, temperature, level,
@@ -231,7 +237,9 @@ def precise_period_reads(r, k, v, beta, gc, u, q, temperature, level,
             cache_rows = torch.where(original_chunks < chunks, cache_rows, 0)
             if (cache_rows < 0).any().item():
                 raise ValueError('Chunk cache is missing part of a selected period history')
-            kn, wn, writes, end, z = (x[cache_rows] for x in chunk_cache[1:])
+            kn, wn, writes, end, z = (x[cache_rows] for x in chunk_cache[1:6])
+            kk, bb, gg = (x[cache_rows] for x in
+                          (chunk_cache.raw_k, chunk_cache.raw_beta, chunk_cache.raw_gc))
         else:
             kn, wn, writes, end, z = _coarse_state_factors(kk, vv, bb, gg)
         state = (RefinedStates.apply(kn, wn, writes, end, period_chunks, norm_floor)

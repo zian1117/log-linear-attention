@@ -67,13 +67,15 @@ class TestRefinedGuardFallback(unittest.TestCase):
             out[0, 3] = torch.nan
             out[1, 0] += .5
             return out
+        def reverse_guard(k, w, decay, direct, adjoint, period, *, return_projection=False):
+            return (reverse_mask, k @ adjoint) if return_projection else reverse_mask
         with mock.patch.object(module, 'refined_states', bad_forward), mock.patch.object(module, 'refined_adjoints', bad_reverse):
             if actual_guard:
                 actual = module.RefinedStates.apply(*actual_inputs, 3, 1e-6)
                 upstream = randn(*actual.shape)
                 actual_gradients = torch.autograd.grad((actual * upstream).sum(), actual_inputs)
             else:
-                with mock.patch.object(module, 'forward_failures', return_value=forward_mask), mock.patch.object(module, 'reverse_failures', return_value=reverse_mask):
+                with mock.patch.object(module, 'forward_failures', return_value=forward_mask), mock.patch.object(module, 'reverse_failures', side_effect=reverse_guard):
                     actual = module.RefinedStates.apply(*actual_inputs, 3, 1e-6)
                     upstream = randn(*actual.shape)
                     actual_gradients = torch.autograd.grad((actual * upstream).sum(), actual_inputs)

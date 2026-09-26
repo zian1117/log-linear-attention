@@ -33,11 +33,11 @@ def _reverse_defect(k, w, decay, direct, adjoint, period):
 
 
 @torch.compile
-def _factor_gradients(k, w, value, state, adjoint, period):
+def _factor_gradients(k, w, value, state, adjoint, period, projected_adjoint=None):
     position = torch.arange(k.shape[1], device=k.device)
     write = (position % period < period//2)[None, :, None, None]
     residual = torch.where(write, value, 0.) - w @ state
-    du = k @ adjoint
+    du = k @ adjoint if projected_adjoint is None else projected_adjoint
     dk = residual @ adjoint.transpose(-1, -2)
     dw = -(du @ state.transpose(-1, -2))
     dv = torch.where(write, du, 0.)
@@ -166,10 +166,22 @@ class RefinedStates(torch.autograd.Function):
         if vp or kp:
             direct = F.pad(direct, (0, vp, 0, kp))
         adjoint = refined_adjoints(k, w, decay, direct, ctx.period, refinements=ctx.refinements)
+        projected_adjoint = None
         if ctx.guarded:
-            failed = reverse_failures(k, w, decay, direct, adjoint, ctx.period)
+            failed, projected_adjoint = reverse_failures(
+                k, w, decay, direct, adjoint, ctx.period, return_projection=True)
+            previous_adjoint = adjoint
             adjoint = _precise_reverse_periods(k, w, decay, direct, adjoint, ctx.period, failed)
-        gradients = _factor_gradients(k, w, value, state, adjoint, ctx.period)
+            if adjoint is not previous_adjoint:
+                # The cached product used the rejected adjoint. Replace every
+                # token of each repaired period, including nonfinite products.
+                indices = failed.reshape(-1).nonzero(as_tuple=False).flatten()
+                repaired = (_gather_periods(k, indices, ctx.period)
+                            @ _gather_periods(adjoint, indices, ctx.period))
+                projected_adjoint = _replace_periods(projected_adjoint, indices,
+                                                     repaired, ctx.period)
+        gradients = _factor_gradients(k, w, value, state, adjoint, ctx.period,
+                                      projected_adjoint=projected_adjoint)
         gradients = (gradients[0][..., :chunk, :key_dim], gradients[1][..., :chunk, :key_dim],
                      gradients[2][..., :chunk, :value_dim], gradients[3])
         return tuple(x.to(dtype) for x, dtype in zip(gradients, ctx.input_dtypes)) + (None,) * (ctx.input_count - 4)

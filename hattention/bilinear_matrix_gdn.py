@@ -20,6 +20,13 @@ from .bucket_frobenius import local_bucket_norm2, high_bucket_norm2, _segment_bl
 _CHUNK_SIZE = 64
 
 
+def _gdn_normalize(x):
+    # Share one promotion: numerator and denominator gradients must cancel
+    # in FP32 before the single conversion back to a BF16 input.
+    x = x.float()
+    return x * torch.rsqrt(x.square().sum(-1, keepdim=True) + 1e-6)
+
+
 @torch.compile
 def _prepare(r, k, v, beta, gc, q):
     c = k.shape[-2]
@@ -191,17 +198,20 @@ def precise_bilinear_matrix_gdn(r, k, v, g, beta, u, q, log_temperature,
             bsz * heads, nchunks, chunk, *x.shape[3:]).contiguous()
 
     with torch.autocast('cuda', enabled=False):
-        r = r.float() * torch.rsqrt(r.float().square().sum(-1, keepdim=True) + 1e-6)
-        k = k.float() * torch.rsqrt(k.float().square().sum(-1, keepdim=True) + 1e-6)
+        r, k = _gdn_normalize(r), _gdn_normalize(k)
         q = F.normalize(q.float(), dim=-1, eps=vector_eps)
         u = F.normalize(u.float(), dim=-1, eps=vector_eps)
         r, k, v, q, u = map(chunks, (r, k, v, q, u))
         beta = chunks(beta)
         gc = chunks(g).double().cumsum(-1)
+        # Share each promotion across preparation, reads, and norms. Their
+        # large cancelling gradient contributions must meet in FP64 before
+        # the single cast back to the original FP32 normalized input.
+        r, k, v, q, u, beta = (x.double() for x in (r, k, v, q, u, beta))
         # Erasure can make a bucket tiny through cancellation. Numerators and
         # norms must use the same precision before the denominator floor.
         kn, wn, writes, end, rn, qn, ar, aq, terms = _prepare(
-            r.double(), k.double(), v.double(), beta.double(), gc, q.double())
+            r, k, v, beta, gc, q)
         temperature = log_temperature.double().unsqueeze(0).expand(bsz, -1).reshape(bsz * heads, 1, 1).exp()
         ys, scores = [], []
         local_levels = min(chunk.bit_length(), levels)

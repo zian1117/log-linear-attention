@@ -57,7 +57,7 @@ def _forward_quantities(k, w, value, decay, state, period, norm_floor):
 
 
 @torch.compile
-def _reverse_quantities(k, w, decay, direct, adjoint, period):
+def _reverse_quantities(k, w, decay, direct, adjoint, period, return_projection=False):
     position = torch.arange(k.shape[1], device=k.device)
     intermediate = k @ adjoint
     transition = (decay[..., None, None] * adjoint
@@ -77,7 +77,8 @@ def _reverse_quantities(k, w, decay, direct, adjoint, period):
               & torch.where(valid, torch.isfinite(direct).all(dim=-1).all(dim=-1), True))
     terminal = ((position + 1 == k.shape[1]) | ((position + 1) % period == 0))[None, :]
     finite = finite & torch.where(terminal, (adjoint == 0).all(dim=-1).all(dim=-1), True)
-    return local_error, _norm(adjoint), relevant_direct, finite
+    result = (local_error, _norm(adjoint), relevant_direct, finite)
+    return (*result, intermediate) if return_projection else result
 
 
 @triton.jit
@@ -151,10 +152,12 @@ def forward_failures(k, w, value, decay, state, period, norm_floor):
 
 
 @torch.no_grad()
-def reverse_failures(k, w, decay, direct, adjoint, period):
-    """Check the adjoint solve for the supplied direct gradient, not the loss."""
+def reverse_failures(k, w, decay, direct, adjoint, period, *, return_projection=False):
+    """Check the adjoint solve; optionally return its K @ adjoint for reuse."""
     _validate(k, period)
     k, w, decay, direct, adjoint = (x.double() for x in (k, w, decay, direct, adjoint))
-    local, scale, relevant_direct, finite = _reverse_quantities(
-        k, w, decay, direct, adjoint, period)
-    return _dispatch(decay, local, scale, relevant_direct, finite, period, True)
+    quantities = _reverse_quantities(
+        k, w, decay, direct, adjoint, period, return_projection=return_projection)
+    local, scale, relevant_direct, finite = quantities[:4]
+    failed = _dispatch(decay, local, scale, relevant_direct, finite, period, True)
+    return (failed, quantities[4]) if return_projection else failed

@@ -10,7 +10,7 @@ from functools import lru_cache
 from types import FunctionType
 from torch.utils.checkpoint import checkpoint
 
-from .bilinear_matrix_gdn import _RoutingReduce, _CHUNK_SIZE
+from .bilinear_matrix_gdn import _RoutingReduce, _CHUNK_SIZE, _gdn_normalize
 from .bucket_frobenius import _segment_blocks
 from .energy_bucket_norm import _local_energy, _high_energy
 from .fenwick_gather import active_select, active_scatter
@@ -21,6 +21,10 @@ _local_energy = getattr(_local_energy, "_torchdynamo_orig_callable", _local_ener
 _high_energy = getattr(_high_energy, "_torchdynamo_orig_callable", _high_energy)
 from .softmax_matrix_gdn import _states, _state_bwd
 from .decay_mass import local_mass, chunk_mass_summaries, boundary_mass, high_mass
+
+# Bound the number of compiled repair-prefix lengths. This is a scheduling
+# granularity in computational chunks, unrelated to key/value dimensions.
+_REPAIR_PREFIX_QUANTUM = 32
 
 
 class _FloatStates(torch.autograd.Function):
@@ -259,13 +263,34 @@ def _repair_periods(ys, scores, masks, nonfinite, inputs, floor, output_dtype,
         if padding:
             flat = F.pad(flat, (0, padding))
         period_masks.append(flat.reshape(flat.shape[0], -1, period).any(-1))
-    # One synchronization after all fast levels, rather than a barrier between
-    # every pair of GPU computations. Selection stays detached from autograd.
-    needed = torch.stack([x.any() for x in period_masks]).tolist()
+    # Transfer both repair decisions and last requested read positions in one
+    # synchronization. A shorter history preserves the original Fenwick period
+    # and its write half; it only omits states after every requested read.
+    read_masks, history_chunks = {}, {}
+    chunk = inputs[1].shape[-2]
+    coarse_start = chunk.bit_length()
+    if repair_chunks and compact_cache_reads and len(masks) > coarse_start:
+        offsets = torch.arange(inputs[1].shape[1], device=inputs[1].device)
+        decisions = []
+        for level, selected in enumerate(period_masks):
+            required = selected.any().long()
+            last = torch.zeros_like(required)
+            if level >= coarse_start:
+                read_masks[level] = masks[level].any(-1) & ~bad_heads[:, None]
+                period_chunks = (1 << level) // chunk
+                last = torch.where(read_masks[level], offsets % period_chunks + 1, 0).amax()
+            decisions.append(torch.stack((required, last)))
+        decisions = torch.stack(decisions).tolist()
+        needed = [bool(required) for required, _ in decisions]
+        for level in range(coarse_start, len(masks)):
+            last = decisions[level][1]
+            rounded = triton.cdiv(last, _REPAIR_PREFIX_QUANTUM) * _REPAIR_PREFIX_QUANTUM
+            history_chunks[level] = min((1 << level) // chunk, rounded)
+    else:
+        needed = torch.stack([x.any() for x in period_masks]).tolist()
     chunk_cache = None
+    read_input_cache = None
     if repair_chunks:
-        chunk = inputs[1].shape[-2]
-        coarse_start = chunk.bit_length()
         if any(needed[coarse_start:]):
             from .precise_period_reads import prepare_precise_chunk_cache
             with torch.no_grad():
@@ -274,19 +299,31 @@ def _repair_periods(ys, scores, masks, nonfinite, inputs, floor, output_dtype,
                 for level in range(coarse_start, len(period_masks)):
                     if needed[level]:
                         period_chunks = (1 << level) // chunk
-                        required |= period_masks[level].index_select(1, indices // period_chunks)
+                        selected = period_masks[level].index_select(1, indices // period_chunks)
+                        if compact_cache_reads:
+                            selected = selected & (indices % period_chunks < history_chunks[level])
+                        required |= selected
             chunk_cache = prepare_precise_chunk_cache(
                 inputs[1], inputs[2], inputs[3], inputs[4], required)
+            if compact_cache_reads:
+                from .cached_chunk_reads import prepare_precise_read_input_cache
+                r, k, _, beta, gc, u, q, _ = inputs
+                required_reads = torch.stack(tuple(read_masks.values())).any(0)
+                read_input_cache = prepare_precise_read_input_cache(
+                    r, k, beta, gc, u, q, required_reads, chunk_cache=chunk_cache)
     for level, selected in enumerate(period_masks):
         if needed[level]:
             if repair_chunks and (1 << level) > inputs[1].shape[-2]:
-                selected_chunks = masks[level].any(-1) & ~bad_heads[:, None]
+                selected_chunks = (read_masks[level] if compact_cache_reads else
+                                   masks[level].any(-1) & ~bad_heads[:, None])
                 if compact_cache_reads:
                     from .cached_chunk_reads import cached_chunk_reads
                     r,k,_,beta,gc,u,q,temperature = inputs
                     ids,y,score = cached_chunk_reads(
                         r,k,beta,gc,u,q,temperature,level,selected,selected_chunks,
-                        chunk_cache,norm_floor=floor,output_dtype=output_dtype)
+                        chunk_cache,norm_floor=floor,output_dtype=output_dtype,
+                        read_input_cache=read_input_cache,
+                        history_chunks=history_chunks[level])
                 else:
                     ids, y, score = precise_period_reads(
                         *inputs, level, selected, norm_floor=floor,
@@ -321,8 +358,7 @@ def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, ve
         return x.reshape(bsz,nchunks,chunk,heads,*x.shape[3:]).movedim(3,1).reshape(
             bsz*heads,nchunks,chunk,*x.shape[3:]).contiguous()
     with torch.autocast('cuda',enabled=False):
-        r=r.float()*torch.rsqrt(r.float().square().sum(-1,keepdim=True)+1e-6)
-        k=k.float()*torch.rsqrt(k.float().square().sum(-1,keepdim=True)+1e-6)
+        r,k=_gdn_normalize(r),_gdn_normalize(k)
         u=F.normalize(u.float(),dim=-1,eps=vector_eps)
         q=F.normalize(q.float(),dim=-1,eps=vector_eps)
         r,k,v,u,q=map(chunks,(r,k,v,u,q))
