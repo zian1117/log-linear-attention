@@ -97,8 +97,8 @@ dimension 64, versus the previous `single_probe` implementation (`e8fcd9f`):
 
 | GPU / job | Bilinear layer | Reference layer | Ratio | Peak allocated memory, new / reference |
 | --- | ---: | ---: | ---: | ---: |
-| L40S / 24001359 | 0.6807 s | 0.4370 s | 1.56x | 27.74 / 13.75 GB |
-| H200 / 24002110 | 0.2054 s | 0.08014 s | 2.56x | 27.79 / 13.80 GB |
+| L40S / 24002788 | 0.6784 s | 0.4372 s | 1.55x | 27.75 / 13.75 GB |
+| H200 / 24002787 | 0.2050 s | 0.08011 s | 2.56x | 27.79 / 13.80 GB |
 
 These are warmed layer measurements with common parameters matched, using an
 initialized first layer and saved validation tokens; they are not complete
@@ -142,6 +142,8 @@ python tests/test_normalization_precision.py
 python tests/test_refined_projection_reuse.py
 python tests/test_repair_prefix.py
 python tests/test_bilinear_model_integration.py
+python tests/test_radial_metadata.py
+python tests/test_radial_routing_precision.py
 ```
 
 Run these inside the repository's CUDA/FLA runtime.
@@ -254,15 +256,14 @@ relative gradient errors 7.98e-7 and 8.84e-7; cold/warm results were identical.
 These arithmetic fixes preserve the model equations and existing guard
 thresholds. Their effect on training quality remains unmeasured.
 
-The broader audit has also reproduced **unresolved coarse routing-gradient
-cancellation**. In two constructed GPU cases, the relative L2 error in the
-source write's sigmoid-parameter gradient was 43% and 28%, although output
-differences were below 5e-9. Detaching only the routing scores removed nearly
-all of that discrepancy. A CPU example with a moderate aligned erasure shows
-the related problem for erase strength. These are conditioning failures in
-the tested gradients, not measurements of training prevalence or loss impact.
-Additional numerical diagnostics and algebraic changes remain under study;
-the existing diagnostics do not yet catch all these cases.
+The broader audit reproduced coarse routing-gradient cancellation that the
+previous forward-error diagnostics missed. In two constructed GPU cases,
+relative L2 error in the source write's sigmoid-parameter gradient was 43%
+and 28%, although output differences were below 5e-9. Detaching only routing
+scores removed nearly all of the discrepancy. Subsequent cases also exposed
+errors through erasures during a bucket's write half. The history-aware
+precision selection described below now covers these reproduced failures.
+Their prevalence during training and effect on validation loss are unmeasured.
 
 A separate actual bug in non-reentrant gradient checkpointing was fixed:
 reducer backward accessed `ctx.saved_tensors` twice, triggering a second
@@ -287,4 +288,47 @@ Further tests of final softmax reduction followed by gated RMSNorm covered ten
 FP32/BF16 cases: saturation, cancelling reads, tiny reads, and reads near the
 RMSNorm floor. No additional consequential failure was found. This CPU Triton
 interpreter audit supplements the native GPU tests; it does not replace them.
-The outstanding coarse-gradient cases above remain unresolved in this commit.
+
+Additional precision selection now covers normalized-score gradients through
+historical writes and erasures. An update that nearly only rescales a matrix
+should scarcely change its normalized direction; separately rounded numerator
+and denominator gradients can fail to cancel even when the forward norm is
+accurate. The public backend checks:
+
+- alignment between the accumulated write-norm bound and the matrix norm;
+- dominance by one source write, using positive largest/remainder summaries;
+- near-parallel matrix changes at every write and read-half erasure, using
+  scalar Cauchy-gap identities and projections already computed by the router.
+
+The remainder is summed directly from nonnegative terms, rather than obtained
+by subtracting the largest write from a rounded total. A dominant-source check
+alone is insufficient: a two-source regression still had a 6.53% value-gradient
+error until its intervening write-half erase was included. Every detected
+historical event selects all subsequent reads in that bucket's period. Repairs
+retain the entire differentiable preceding history, including earlier writes
+and erasures. Decisions are detached; scores, norm floors, value reads, and
+model parameters are unchanged. These diagnostics supplement the prior guards;
+they are not certified error bounds for arbitrary gradients.
+
+Validation on H200 `24002787` and L40S `24002788`: all nine new public-path
+regressions (seven FP32 and two native BF16), scalar-summary/history tests,
+existing view/norm/stress cases, and all eight model lifecycle tests passed.
+The constructed write-half erase case's value-gradient relative L2 error fell
+from 12.8% to about 1e-6; the two-source case fell from 6.53% to about 1e-6.
+Relative L2 error here means the Euclidean norm of the gradient difference
+divided by the reference gradient norm. Historical gate derivatives are checked
+separately so larger current-token gradients cannot hide their errors.
+
+Fresh-process compiled 16K checks on the same GPUs passed outputs and all eight
+input gradients. Largest per-head gradient relative L2 errors were 6.87e-7
+and 6.52e-7 for FP32 inputs, and 0.000261 and 0.000301 for native BF16 inputs.
+Cold and warm results matched. The native-dtype tests use their separately
+specified rounding allowance; they are not a relaxation of the FP32 checks.
+
+Both jobs completed successfully and verified all 126 frozen source hashes.
+A separate matched operator comparison measured the new diagnostics at 3.41%
+additional time on H200 (0.18539 to 0.19170 s) and 3.49% on L40S (0.63553 to
+0.65772 s). This control disables only the newly added diagnostics; it is not
+a supported deployment mode. These operator timings exclude model projections
+and should not be substituted for the full-layer timings above. The requested
+full-layer performance target remains unmet.

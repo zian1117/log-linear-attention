@@ -107,7 +107,7 @@ def _state_backward(Q, R, DQ, DY, H, DI, DH,
 
 class _FusedProjectedCoarse(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, projected, beta, k, gc, state, rn, qn, u, temperature, floor, output_dtype, raw_half, head_groups):
+    def forward(ctx, projected, beta, k, gc, state, rn, qn, u, temperature, floor, output_dtype, raw_half, head_groups, return_metadata):
         bh, n, c, value_dim = projected.shape
         key_dim = state.shape[-2]
         tensors = tuple(x if raw_half and i in (1,2,3,5,6,7) else x.contiguous()
@@ -135,11 +135,15 @@ class _FusedProjectedCoarse(torch.autograd.Function):
         ctx.save_for_backward(*tensors, stats, qread)
         ctx.coarse_dimensions = bh, n, c, key_dim, value_dim, floor, shared_temp, raw_half, head_groups
         norm2 = stats[:, 0].reshape(bh, n, c)
+        if return_metadata:
+            metadata = stats.reshape(bh, n, 5, c)
+            ctx.mark_non_differentiable(norm2, bound, metadata)
+            return y, scores, norm2, bound, metadata
         ctx.mark_non_differentiable(norm2, bound)
         return y, scores, norm2, bound
 
     @staticmethod
-    def backward(ctx, dy, ds, _dnorm, _dbound):
+    def backward(ctx, dy, ds, _dnorm, _dbound, _dmetadata=None):
         projected, beta, k, gc, state, rn, qn, u, temperature, stats, qread = ctx.saved_tensors
         bh, n, c, key_dim, value_dim, floor, shared_temp, raw_half, head_groups = ctx.coarse_dimensions
         matrices = bh*n
@@ -163,11 +167,11 @@ class _FusedProjectedCoarse(torch.autograd.Function):
             qn, rn, dq, dy, state, di, dh, c, key_dim, value_dim,
             16, 64, 64, num_warps=4, num_stages=1, RAW_HALF=raw_half)
         dtemperature = dt.reshape(bh//head_groups, n*head_groups, c).sum_to_size(temperature.shape)
-        return dz, dbeta, kg, dgc, dh, rg, qg, du, dtemperature, None, None, None, None
+        return dz, dbeta, kg, dgc, dh, rg, qg, du, dtemperature, None, None, None, None, None
 
 
 def fused_projected_coarse_core(projected, beta, k, gc, state, rn, qn, u, temperature, mass0,
-                      floor, output_dtype, return_masks=False, *, raw_half=0, head_groups=1):
+                      floor, output_dtype, return_masks=False, return_metadata=False, *, raw_half=0, head_groups=1):
     """Experimental replacement for projected_coarse_router._core.
 
 The projected input is P=z@state supplied by the state scan. Its gradient is
@@ -195,12 +199,14 @@ head_groups restores each original head's shared temperature and flags.
                           and (temperature.shape[0] == 1 or temperature.shape[0] == projected.shape[0]//head_groups)))
     if not valid_temperature:
         raise ValueError('Temperature must be scalar or have shape [heads*batch,1,1].')
-    y, scores, norm2, bound = _FusedProjectedCoarse.apply(
-        projected, beta, k, gc, state, rn, qn, u, temperature, floor, output_dtype, raw_half, head_groups)
+    values = _FusedProjectedCoarse.apply(
+        projected, beta, k, gc, state, rn, qn, u, temperature, floor, output_dtype, raw_half, head_groups, return_metadata)
+    y, scores, norm2, bound = values[:4]
+    metadata = values[4:]
     # Import lazily: callers can later dispatch from the existing fast module.
     from .fast_matrix_gdn import _diagnostics
     from .decay_mass import high_mass
     bad, nonfinite = _diagnostics(norm2, bound, high_mass(mass0, gc), scores, y, floor)
     if return_masks:
-        return y, scores, bad, nonfinite
-    return y, scores, bad.reshape(bad.shape[0]//head_groups, -1).any(-1)
+        return (y, scores, bad, nonfinite, *metadata)
+    return (y, scores, bad.reshape(bad.shape[0]//head_groups, -1).any(-1), *metadata)

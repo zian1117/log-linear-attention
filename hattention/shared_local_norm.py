@@ -17,7 +17,7 @@ from .energy_bucket_norm import _right_terms
 
 
 @torch.compile(fullgraph=True)
-def _shared_core(k, v, beta, inverse, decay, levels, active_residuals):
+def _shared_core(k, v, beta, inverse, decay, levels, active_residuals, return_metadata=False):
     chunk = k.shape[-2]
     key_norm2 = k.square().sum(-1)
     value_norm2 = v.square().sum(-1)
@@ -26,6 +26,7 @@ def _shared_core(k, v, beta, inverse, decay, levels, active_residuals):
     # Keep the old-state projection separate from v. Forming v+d and then
     # subtracting v would lose d when the old state is small.
     prefix_delta = torch.zeros_like(v)
+    write_flags = []
     for level in range(1, levels):
         period = 1 << level
         half = period // 2
@@ -53,11 +54,12 @@ def _shared_core(k, v, beta, inverse, decay, levels, active_residuals):
         # For a write residual e=v+d, the exact energy increment is
         # beta²*||k||²*||e||² - 2*beta*d·e. This avoids subtracting two
         # O(beta) terms to recover an O(beta²) first-write energy.
+        delta_dot_residual = (delta[..., :half, :] * preceding[..., :half, :]).sum(-1)
         write_increment = (b[..., :half].square()
                            * key_norm2.reshape(scalar_shape)[..., :half]
                            * residual_norm2[..., :half]
                            - 2 * b[..., :half]
-                           * (delta[..., :half, :] * preceding[..., :half, :]).sum(-1))
+                           * delta_dot_residual)
         erase_increment = -coefficient[..., half:] * residual_norm2[..., half:]
         increments = torch.cat((write_increment, erase_increment), dim=-1)
         norm2 = (decay_block.square() @ increments.unsqueeze(-1)).squeeze(-1)
@@ -68,14 +70,26 @@ def _shared_core(k, v, beta, inverse, decay, levels, active_residuals):
             absolute_increments = 2 * b.abs() * cross_bound + coefficient.abs() * residual_norm2
             bound = (decay_block.square() @ absolute_increments.unsqueeze(-1)).squeeze(-1)
         results.append((norm2.reshape_as(beta), bound.reshape_as(beta)))
-        if level + 1 < levels:
+        if return_metadata:
+            from .radial_diagnostics import write_derivative_scalar
+            with torch.no_grad():
+                prior = torch.cat((torch.zeros_like(norm2[..., :1]), norm2[..., :half-1]), -1)
+                step_decay = torch.cat((torch.ones_like(prior[..., :1]),
+                    decay_block.diagonal(offset=-1, dim1=-2, dim2=-1)[..., :half-1]), -1)
+                before = prior * step_decay.square()
+                write_flags.append(write_derivative_scalar(
+                    before, -delta_dot_residual, residual_norm2[..., :half],
+                    key_norm2.reshape(scalar_shape)[..., :half]))
+        if level + 1 < levels or return_metadata:
             active = torch.cat((torch.zeros_like(active), active), dim=-2).reshape_as(v)
             prefix_delta = prefix_delta + active
+    if return_metadata:
+        return tuple(results), prefix_delta.detach(), tuple(write_flags)
     return tuple(results)
 
 
 def shared_local_norms(k, v, beta, cumulative_decay, *, terms=None, max_levels=None,
-                       active_residuals=None):
+                       active_residuals=None, return_metadata=False):
     """Return ``((norm2, bound), ...)`` in increasing local Fenwick level.
 
     Inputs end in [C,K/V] and [C], where C is a power-of-two chunk length.
@@ -86,6 +100,9 @@ def shared_local_norms(k, v, beta, cumulative_decay, *, terms=None, max_levels=N
     ``max_levels`` includes level zero and defaults to every local level.
     Optional ``active_residuals`` contains levels 1 onward, each shaped
     [...,C/period,period/2,V], allowing a fused read kernel to supply D once.
+    When return_metadata=True, also return the detached prefix residual through
+    the included hierarchy levels and per-level source-half precision flags.
+    It is a full-chunk prefix only when all local levels are included. Default outputs are unchanged.
     """
     chunk = k.shape[-2]
     if chunk < 1 or chunk & (chunk - 1):
@@ -102,4 +119,4 @@ def shared_local_norms(k, v, beta, cumulative_decay, *, terms=None, max_levels=N
     else:
         inverse, decay = terms[1:3]
     return _shared_core(k, v, beta, inverse, decay, levels,
-                        None if active_residuals is None else tuple(active_residuals))
+                        None if active_residuals is None else tuple(active_residuals), return_metadata)

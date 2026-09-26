@@ -47,7 +47,8 @@ class _DiscardFlaggedGradients(torch.autograd.Function):
 def adaptive_matrix_gdn(r, k, v, g, beta, u, q, log_temperature,
                         norm_floor=1e-6, vector_eps=1e-6, repair_periods=False,
                         shared_local=False, fused_local=False, repair_chunks=False,
-                        shared_gathers=False, compact_cache_reads=False, shared_states=False):
+                        shared_gathers=False, compact_cache_reads=False, shared_states=False,
+                        radial_guards=False):
     """Evaluate FP32, replacing all tokens of flagged batch/head pairs.
 
     Recomputing the whole head preserves its history, including matrix error
@@ -65,7 +66,8 @@ def adaptive_matrix_gdn(r, k, v, g, beta, u, q, log_temperature,
     out, flagged = _fast(*isolated, norm_floor=norm_floor, vector_eps=vector_eps,
                          repair_periods=repair_periods,shared_local=shared_local,fused_local=fused_local,
                          repair_chunks=repair_chunks,shared_gathers=shared_gathers,
-                         compact_cache_reads=compact_cache_reads,shared_states=shared_states)
+                         compact_cache_reads=compact_cache_reads,shared_states=shared_states,
+                         radial_guards=radial_guards)
     selection[0] = flagged
     if flagged.any().item():
         selected = flagged.nonzero(as_tuple=False).flatten()

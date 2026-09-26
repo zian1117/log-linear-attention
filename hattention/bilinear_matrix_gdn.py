@@ -264,5 +264,5 @@ def bilinear_matrix_gdn(r, k, v, g, beta, u, q, log_temperature,
         norm_floor=norm_floor, vector_eps=vector_eps,
         repair_periods=True, shared_local=True, fused_local=True,
         repair_chunks=True, shared_gathers=True, compact_cache_reads=True,
-        shared_states=True,
+        shared_states=True, radial_guards=True,
     )

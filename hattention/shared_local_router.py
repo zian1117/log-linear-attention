@@ -13,7 +13,7 @@ _shared_norm_core = getattr(_shared_norm_core, '_torchdynamo_orig_callable', _sh
 
 
 def _all_local(ar, aq, k, v, beta, u, q, temperature, inverse, decay,
-               floor, output_dtype, levels, use_fused):
+               floor, output_dtype, levels, use_fused, return_metadata=False):
     from .fast_matrix_gdn import _score, _diagnostics
     torch._dynamo.mark_static(k,-2)
     chunk = k.shape[-2]
@@ -38,7 +38,11 @@ def _all_local(ar, aq, k, v, beta, u, q, temperature, inverse, decay,
         projections.append((y,read))
         residuals.append(residual)
         decay_blocks.append(dec)
-    norms = _shared_norm_core(k,v,beta,inverse,decay,levels,tuple(residuals))
+    norm_result = _shared_norm_core(k,v,beta,inverse,decay,levels,tuple(residuals), return_metadata)
+    if return_metadata:
+        norms, prefix_delta, write_flags = norm_result
+    else:
+        norms = norm_result
     result = []
     y = (ar.diagonal(dim1=-2,dim2=-1).unsqueeze(-1)*v).to(output_dtype)
     norm2,bound = norms[0]
@@ -65,10 +69,29 @@ def _all_local(ar, aq, k, v, beta, u, q, temperature, inverse, decay,
             mass = (decay_blocks[level-1][...,half:,:half]
                     @ positive_mass.reshape(shape)[...,:half].unsqueeze(-1)).squeeze(-1)
         bad,nonfinite = _diagnostics(norm2,bound,mass,score,y,floor)
+        if return_metadata:
+            from .radial_metadata import positive_pair
+            from .radial_diagnostics import mass_decision, erase_decision, dominance_decision
+            with torch.no_grad():
+                key2 = k.square().sum(-1).reshape(shape)[...,half:]
+                b = beta.reshape(shape)[...,half:]
+                projection2 = residuals[level-1].square().sum(-1)
+                before = norm2 + b*(2-b*key2)*projection2
+                erase = erase_decision(norm2,before,projection2,key2,level=level,floor=floor)
+                source = mass_decision(norm2,mass,level=level,floor=floor)
+                if level >= 2:
+                    contributions = (decay_blocks[level-1][...,half:,:half]
+                        * positive_mass.reshape(shape)[...,:half].unsqueeze(-2))
+                    _, remainder = positive_pair(contributions)
+                    source = source | dominance_decision(norm2,remainder,floor)
+                history = write_flags[level-1].any(-1,keepdim=True).expand_as(bad)
+                bad = bad | source | erase | history
         y = torch.cat((torch.zeros_like(y),y),-2).flatten(-3,-2)
         score,bad,nonfinite = (torch.cat((torch.zeros_like(x),x),-1).flatten(-2,-1)
                               for x in (score,bad,nonfinite))
         result.extend((y,score,bad,nonfinite))
+    if return_metadata:
+        result.append(prefix_delta)
     return tuple(result)
 
 
@@ -77,19 +100,21 @@ def _checkpoint_impl(*args):
 
 
 @lru_cache(maxsize=None)
-def _compiled_shape(chunk,key_dim,value_dim,input_dtype,output_dtype,floor,levels,use_fused):
-    shape = (chunk,key_dim,value_dim,input_dtype,output_dtype,floor,levels,use_fused)
+def _compiled_shape(chunk,key_dim,value_dim,input_dtype,output_dtype,floor,levels,use_fused,return_metadata):
+    shape = (chunk,key_dim,value_dim,input_dtype,output_dtype,floor,levels,use_fused,return_metadata)
     name = '_shared_local_checkpoint_'+repr(shape)
     function = FunctionType(_checkpoint_impl.__code__.replace(co_name=name),globals(),name)
     return torch.compile(function,fullgraph=True,dynamic=True)
 
 
 def shared_local_router(ar,aq,k,v,beta,gc,u,temperature,terms,floor,output_dtype,levels,
-                        *, q, use_fused=False):
-    args = (ar,aq,k,v,beta,u,q,temperature,terms[1],terms[2],floor,output_dtype,levels,use_fused)
+                        *, q, use_fused=False, return_metadata=False):
+    args = (ar,aq,k,v,beta,u,q,temperature,terms[1],terms[2],floor,output_dtype,levels,use_fused,return_metadata)
     if torch.is_grad_enabled():
         values = _compiled_shape(k.shape[-2],k.shape[-1],v.shape[-1],k.dtype,output_dtype,
-                                 floor,levels,use_fused)(*args)
+                                 floor,levels,use_fused,return_metadata)(*args)
     else:
         values = _all_local(*args)
+    if return_metadata:
+        return (*tuple(list(values[:-1][offset::4]) for offset in range(4)), values[-1])
     return tuple(list(values[offset::4]) for offset in range(4))

@@ -358,8 +358,10 @@ def _repair_periods(ys, scores, masks, nonfinite, inputs, floor, output_dtype,
 def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, vector_eps=1e-6,
                     repair_periods=False, shared_local=False, fused_local=False,
                     repair_chunks=False, shared_gathers=False, compact_cache_reads=False,
-                    shared_states=False):
+                    shared_states=False, radial_guards=False):
     """Return output and [batch*heads] flags requiring precise recomputation."""
+    if radial_guards and not (repair_periods and shared_local and shared_states):
+        raise ValueError('Radial guards require shared local/state routing and period repair.')
     bsz, length, heads, key_dim = k.shape
     value_dim = v.shape[-1]
     output_dtype = v.dtype
@@ -389,9 +391,13 @@ def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, ve
         local_levels=min(chunk.bit_length(),levels)
         if shared_local:
             from .shared_local_router import shared_local_router
-            ys,scores,flags,nonfinite = shared_local_router(
+            local_result = shared_local_router(
                 ar,aq,k,v,beta,gc,u,temperature,terms,norm_floor,output_dtype,
-                local_levels,q=q,use_fused=fused_local)
+                local_levels,q=q,use_fused=fused_local,return_metadata=radial_guards)
+            if radial_guards:
+                ys,scores,flags,nonfinite,local_delta = local_result
+            else:
+                ys,scores,flags,nonfinite = local_result
             if not repair_periods:
                 flags = [x.flatten(1).any(-1) for x in flags]
         else:
@@ -401,6 +407,14 @@ def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, ve
                 ys.append(y);scores.append(score);flags.append(diagnostic[0])
                 if repair_periods:
                     nonfinite.append(diagnostic[1])
+        radial_summaries = None
+        if radial_guards and levels > local_levels:
+            from .radial_metadata import chunk_pair
+            from .radial_diagnostics import coarse_write_history
+            radial_summaries = chunk_pair(k,v,beta,gc)
+            # Lower Fenwick boundary projections partition a larger bucket's
+            # source half. Accumulate only detached CxV vectors, not matrices.
+            prefix_projected = torch.zeros_like(v)
         gathered, state_pairs = None, None
         gathered_views = False
         if (shared_gathers or shared_states) and levels > local_levels:
@@ -425,9 +439,27 @@ def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, ve
             if state_pairs is not None:
                 from .projected_coarse_router import projected_coarse
                 selected = None if gathered is None else tuple(x[level-local_levels] for x in gathered)
+                radial_options = {}
+                if radial_guards:
+                    history_flags,_ = coarse_write_history(
+                        prefix_projected,local_delta,k,v,beta,gc,period)
+                    radial_options = dict(radial_summaries=radial_summaries,
+                                          history_flags=history_flags)
                 y,score,*diagnostic=projected_coarse(
                     *args,selected_inputs=selected,state_pair=state_pairs[level-local_levels],
-                    state_pair_active=True,selected_inputs_grouped=gathered_views)
+                    state_pair_active=True,selected_inputs_grouped=gathered_views,
+                    **radial_options)
+                if radial_guards and level+1 < levels:
+                    with torch.no_grad():
+                        projected = state_pairs[level-local_levels][1].detach()
+                        half = period//2
+                        if nchunks % period == 0:
+                            target = prefix_projected.reshape(bsz*heads,nchunks//period,period,chunk,value_dim)
+                            target[:,:,half:].add_(projected.reshape(bsz*heads,nchunks//period,half,chunk,value_dim))
+                        else:
+                            compact = torch.arange(projected.shape[1],device=k.device)
+                            indices = (compact//half)*period+half+compact%half
+                            prefix_projected.index_add_(1,indices,projected)
             elif gathered is None:
                 y,score,*diagnostic=_coarse(*args)
             else:

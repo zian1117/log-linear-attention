@@ -70,7 +70,11 @@ def _check_grouped_view(x, half):
 def projected_coarse(kn, wn, writes, end, rn, qn, k, beta, gc, u, temperature,
                      period, terms, mass_decay, mass_addition, floor, output_dtype,
                      return_masks=False, selected_inputs=None, state_pair=None,
-                     state_pair_active=False, selected_inputs_grouped=False):
+                     state_pair_active=False, selected_inputs_grouped=False,
+                     radial_summaries=None, history_flags=None):
+    radial = radial_summaries is not None
+    if radial and not return_masks:
+        raise ValueError('Radial diagnostics require per-token repair masks.')
     key_dim,value_dim = k.shape[-1],writes.shape[-1]
     kp = max(16,triton.next_power_of_2(key_dim))-key_dim
     vp = max(16,triton.next_power_of_2(value_dim))-value_dim
@@ -92,6 +96,10 @@ def projected_coarse(kn, wn, writes, end, rn, qn, k, beta, gc, u, temperature,
     rn,qn,k,beta,gc,u = (tuple(active_select(x,period) for x in (rn,qn,k,beta,gc,u))
                         if selected_inputs is None else selected_inputs)
     mass0 = active_select(boundary_mass(mass_decay,mass_addition,period),period)
+    if radial:
+        from .radial_metadata import boundary_pair
+        _, remainder = boundary_pair(mass_decay,*radial_summaries,period)
+        remainder = active_select(remainder,period)
     if selected_inputs_grouped:
         batch, active = projected.shape[:2]
         half, groups = period//2, chunks//period
@@ -102,17 +110,42 @@ def projected_coarse(kn, wn, writes, end, rn, qn, k, beta, gc, u, temperature,
         projected = projected.reshape(batch*groups,half,*projected.shape[2:])
         state = state.reshape(batch*groups,half,*state.shape[2:])
         mass0 = mass0.reshape(batch*groups,half)
+        if radial:
+            remainder = remainder.reshape(batch*groups,half)
     args = (projected,beta,k,gc,state,rn,qn,u,temperature,mass0,floor,output_dtype,return_masks)
+    if radial:
+        args = (*args, True)
     if selected_inputs_grouped:
         if torch.is_grad_enabled():
             y,score,*diagnostic = _compiled_grouped_core(half,groups)(*args)
         else:
             y,score,*diagnostic = _core(*args,raw_half=half,head_groups=groups)
+    else:
+        y,score,*diagnostic = _checkpoint_core(*args) if torch.is_grad_enabled() else _core(*args)
+    if radial:
+        from .radial_diagnostics import (
+            mass_decision,erase_decision,dominance_decision,propagate_read_chunks,
+        )
+        metadata = diagnostic.pop()
+        with torch.no_grad():
+            norm2,raw,projection2,key2 = (metadata[...,i,:] for i in (0,1,3,4))
+            before = raw + beta*(2-beta*key2)*projection2
+            erase = erase_decision(norm2,before,projection2,key2,level=1,floor=floor)
+            source = mass_decision(norm2,high_mass(mass0,gc),level=2,floor=floor)
+            source = source | dominance_decision(norm2,high_mass(remainder,gc),floor)
+            diagnostic[0] = diagnostic[0] | source
+    if selected_inputs_grouped:
         y,score = (x.reshape(batch,active,*x.shape[2:]) for x in (y,score))
         if return_masks:
             diagnostic = [x.reshape(batch,active,*x.shape[2:]) for x in diagnostic]
-    else:
-        y,score,*diagnostic = _checkpoint_core(*args) if torch.is_grad_enabled() else _core(*args)
+        if radial:
+            erase = erase.reshape(batch,active,*erase.shape[2:])
     if return_masks:
         diagnostic = [active_scatter(x,chunks,period) for x in diagnostic]
+    if radial:
+        with torch.no_grad():
+            historical = propagate_read_chunks(active_scatter(erase,chunks,period),period)
+            if history_flags is not None:
+                historical = historical | history_flags
+            diagnostic[0] = diagnostic[0] | historical.unsqueeze(-1)
     return active_scatter(y,chunks,period),active_scatter(score,chunks,period),*diagnostic
