@@ -12,7 +12,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .bilinear_matrix_gdn import _CHUNK_SIZE, _gdn_normalize
 from .tuple_routing_reduce import tuple_routing_reduce
-from .current_bucket_score import current_bucket_score
+from .current_bucket_score import current_bucket_score, previous_bucket_score
 from .bucket_frobenius import _segment_blocks
 from .energy_bucket_norm import _local_energy, _high_energy
 from .fenwick_gather import active_select, active_scatter
@@ -116,7 +116,7 @@ def _current_core(ar, k, v, beta, u, q, temperature, floor, output_dtype, return
     return y, score, bad.reshape(bad.shape[0], -1).any(-1)
 
 
-def _local_core(inv, decay, beta, key, value, ar, aq, u, temperature, floor, output_dtype, return_masks=False):
+def _local_core(inv, decay, beta, key, value, ar, aq, u, q, temperature, floor, output_dtype, return_masks=False):
     # Hierarchy width is structural; batch and chunk counts remain dynamic.
     torch._dynamo.mark_static(key, -2)
     period = key.shape[-2]
@@ -126,7 +126,11 @@ def _local_core(inv, decay, beta, key, value, ar, aq, u, temperature, floor, out
     norm2, bound = norm2[..., half:], bound[..., half:]
     y = ar[..., half:, :half] @ value[..., :half, :]
     read = aq[..., half:, :half] @ value[..., :half, :]
-    score = _score(read, u[..., half:, :], norm2, temperature.unsqueeze(-1), floor)
+    if period == 2:
+        score = previous_bucket_score(key, value, beta, decay, u, q,
+                                      temperature.unsqueeze(-1), floor, norm2)
+    else:
+        score = _score(read, u[..., half:, :], norm2, temperature.unsqueeze(-1), floor)
     with torch.no_grad():
         positive_mass = beta * key.norm(dim=-1) * value.norm(dim=-1)
         mass = (decay @ (positive_mass * writes).unsqueeze(-1)).squeeze(-1)[..., half:]
@@ -175,11 +179,11 @@ def _compiled_local_shape(period, key_dim, value_dim, input_dtype, output_dtype,
     return torch.compile(implementation, fullgraph=True, dynamic=True)
 
 
-def _checkpoint_local_core(inv, decay, beta, key, value, ar, aq, u, temperature,
+def _checkpoint_local_core(inv, decay, beta, key, value, ar, aq, u, q, temperature,
                            floor, output_dtype, return_masks=False):
     return _compiled_local_shape(key.shape[-2], key.shape[-1], value.shape[-1],
                                  key.dtype, output_dtype, floor, return_masks)(
-        inv, decay, beta, key, value, ar, aq, u, temperature, floor, output_dtype, return_masks)
+        inv, decay, beta, key, value, ar, aq, u, q, temperature, floor, output_dtype, return_masks)
 
 
 @torch.compile(fullgraph=True, dynamic=True)
@@ -198,7 +202,8 @@ def _local(ar, aq, k, v, beta, gc, u, temperature, level, terms, floor, output_d
     inv, decay = (_segment_blocks(x, period).contiguous() for x in terms[1:3])
     args = (inv, decay, beta.reshape(shape), key, value,
             _segment_blocks(ar, period).contiguous(), _segment_blocks(aq, period).contiguous(),
-            u.reshape(*shape, u.shape[-1]), temperature, floor, output_dtype, return_masks)
+            u.reshape(*shape, u.shape[-1]), q.reshape(*shape, q.shape[-1]),
+            temperature, floor, output_dtype, return_masks)
     return _checkpoint_local_core(*args) if torch.is_grad_enabled() else _local_core(*args)
 
 

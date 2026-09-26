@@ -1,4 +1,4 @@
-"""Score a rank-one current-token memory without cancelling beta gradients."""
+"""Score single-write memories without cancelling their scale gradients."""
 import torch
 
 
@@ -23,3 +23,20 @@ def current_bucket_score(k, v, beta, u, q, temperature, floor, norm2=None):
     gain = torch.where(above, beta.sign() * base2.rsqrt(), beta / floor)
     numerator = (q * k).sum(-1) * (u * v).sum(-1)
     return temperature * numerator * gain
+
+
+def previous_bucket_score(k, v, beta, decay, u, q, temperature, floor, norm2):
+    """Score the first token's memory after the second token's erase.
+
+    Inputs contain two tokens in their penultimate (vector) or final (scalar)
+    axis; decay contains their 2-by-2 pairwise decay factors. Return a singleton
+    token axis, matching the active half of a two-token Fenwick period.
+    Existing norm diagnostics remain necessary when the erase nearly cancels
+    the effective key. The value read is computed separately and is unchanged.
+    """
+    first, second = k[..., :1, :], k[..., 1:, :]
+    effective_key = first - beta[..., 1:, None] * (first * second).sum(-1, keepdim=True) * second
+    scale = beta[..., :1] * decay[..., 1:, 0]
+    return current_bucket_score(effective_key, v[..., :1, :], scale,
+                                u[..., 1:, :], q[..., 1:, :],
+                                temperature, floor, norm2)

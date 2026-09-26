@@ -98,13 +98,15 @@ class TestCurrentBucketScore(unittest.TestCase):
         finally:
             environment.tearDownClass()
 
-    def compare_shared_case(self, fast, device, seed, beta_value):
+    def compare_shared_case(self, fast, device, seed, beta_value, *, small_index=1, shared_local=True, near_erase=False):
         generator = torch.Generator().manual_seed(seed)
         batch, length, heads, key_dim, value_dim = 64, 2, 1, 128, 64
         def randn(*shape):
             return torch.randn(shape, generator=generator).to(device)
         r = randn(batch, length, heads, key_dim)
         k = torch.zeros_like(r); k[:, 0, :, 1] = 1; k[:, 1, :, 0] = 1
+        if near_erase:
+            k[:, 1] = k[:, 0]
         v = randn(batch, length, heads, value_dim) * .1
         v[:, 1] = v[:, 0]
         u = v.clone()
@@ -112,7 +114,9 @@ class TestCurrentBucketScore(unittest.TestCase):
         g = torch.full((batch, length, heads), -.02, device=device)
         temperature = torch.full((heads,), math.log(math.sqrt(key_dim * value_dim)), device=device)
         raw_logit = torch.zeros(batch, length, heads, device=device)
-        raw_logit[:, 1] = math.log(beta_value / (1 - beta_value))
+        raw_logit[:, small_index] = math.log(beta_value / (1 - beta_value))
+        if near_erase:
+            raw_logit[:, 1] = math.log(.999 / .001)
         gate = F.silu(randn(batch, heads, value_dim))
         upstream = randn(batch, heads, value_dim)
         actual_logit = raw_logit.clone().requires_grad_()
@@ -126,13 +130,16 @@ class TestCurrentBucketScore(unittest.TestCase):
         with patch.object(fast, 'tuple_routing_reduce', reducer), patch.object(fast, '_repair_periods', record_masks):
             actual, flagged = fast.fast_matrix_gdn(
                 r, k, v, g, actual_logit.sigmoid(), u, q, temperature,
-                repair_periods=True, shared_local=True, fused_local=device == 'cuda')
+                repair_periods=True, shared_local=shared_local, fused_local=device == 'cuda')
             actual = actual[:, 1]
         self.assertFalse(flagged.any())
-        self.assertEqual(sum(masks), 0)
+        if near_erase:
+            self.assertGreater(sum(masks), 0)
+        else:
+            self.assertEqual(sum(masks), 0)
         # Independent literal two-token recurrence with exactly the same
-        # normalized input vectors. The orthogonal keys make the history's
-        # derivative with respect to the current erase gate exactly zero.
+        # normalized input vectors. Ordinary cases have orthogonal keys; the
+        # near-erasure case keeps the full coupled state derivative.
         rr, kk = (fast._gdn_normalize(x).double() for x in (r, k))
         uu, qq = (F.normalize(x.float(), dim=-1, eps=1e-6).double() for x in (u, q))
         beta = expected_logit.sigmoid().double()
@@ -151,8 +158,9 @@ class TestCurrentBucketScore(unittest.TestCase):
         def loss(output):
             normalized = output * torch.rsqrt(output.square().mean(-1, keepdim=True) + 1e-6)
             return (normalized * gate * upstream).sum()
-        got = torch.autograd.grad(loss(actual), actual_logit)[0][:, 1]
-        want = torch.autograd.grad(loss(expected), expected_logit)[0][:, 1]
+        gradient_index = 1 if near_erase else small_index
+        got = torch.autograd.grad(loss(actual), actual_logit)[0][:, gradient_index]
+        want = torch.autograd.grad(loss(expected), expected_logit)[0][:, gradient_index]
         self.assertTrue(torch.isfinite(got).all())
         torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-8)
         self.assertLess((got - want).norm().item(), 3e-5 * want.norm().item() + 1e-9)

@@ -95,8 +95,8 @@ dimension 64, versus the previous `single_probe` implementation (`e8fcd9f`):
 
 | GPU / job | Bilinear layer | Reference layer | Ratio | Peak allocated memory, new / reference |
 | --- | ---: | ---: | ---: | ---: |
-| L40S / 23998754 | 0.7111 s | 0.4374 s | 1.63x | 30.11 / 13.75 GB |
-| H200 / 23998737 | 0.1954 s | 0.07384 s | 2.65x | 30.13 / 13.80 GB |
+| L40S / 23999279 | 0.7128 s | 0.4372 s | 1.63x | 30.11 / 13.75 GB |
+| H200 / 23999273 | 0.1920 s | 0.07341 s | 2.61x | 30.13 / 13.80 GB |
 
 These are warmed layer measurements with common parameters matched, using an
 initialized first layer and saved validation tokens; they are not complete
@@ -128,6 +128,8 @@ python tests/test_multi_active_select.py
 python tests/test_multi_projected_states.py
 python tests/test_compact_projected_states.py
 python tests/test_shared_precise_input_cache.py
+python tests/test_stable_write_energy.py
+python tests/test_previous_bucket_score.py
 python tests/test_current_bucket_score.py
 python tests/test_tuple_routing_reduce.py
 python tests/test_multi_cache_gather.py
@@ -215,7 +217,34 @@ compiled 16K public-path output/all-eight-gradient comparisons. Maximum
 reported relative gradient errors were 6.51e-7 and 9.45e-7; cold/warm results
 were identical. The mixed-head and boundary CPU integration regressions passed.
 
-The broader numerical audit is ongoing. A constructed singleton-history case
-has additionally exposed avoidable subtraction in the write-energy identity
-used by local Frobenius norms; correcting only the current-token score does
-not fix that separate path. Its stable algebraic rewrite is being tested.
+The broader audit additionally reproduced an unflagged gradient error in a
+singleton history bucket with source beta=0.003: relative sigmoid-gradient
+error reached 17.3% in a constructed aligned-query example. Two equivalent
+arithmetic changes address that path:
+
+- For each local write, retain the old-state projection `d` separately from the
+  residual `e = v + d`. Compute its squared-norm increment as
+  `beta² * ||k||² * ||e||² - 2 * beta * dot(d,e)`. The first write now directly
+  produces its O(beta²) energy rather than subtracting two O(beta) quantities.
+  Shared and separate local paths use this formula; erase-only increments and
+  the original bound/repair formulas remain unchanged.
+- The previous-token bucket is also rank one. Its effective key is
+  `k_previous - beta_current * dot(k_previous,k_current) * k_current`, with
+  scalar amplitude `beta_previous * exp(g_current)`. Its score uses these
+  factors directly, cancelling amplitude above the floor while retaining the
+  correct erase-direction and below-floor gradients. Value reads are unchanged.
+
+The energy rewrite alone reduced the constructed 17.3% error to 0.080%; the
+factored singleton score reduced it to 1.64e-7. This does not remove the need
+for precision repair: near-complete erasure still subtracts nearly equal keys.
+Tests confirm that existing diagnostics detect that case and the complete
+public path returns accurate gradients after repair.
+
+H200 `23999273` and L40S `23999279` passed the CPU/GPU formula, scale-gradient,
+zero/floor, and near-erasure regressions. Independent literal recurrences check
+all norm inputs and all nine singleton-score inputs, including odd dimensions
+and negative source beta. Existing 12 cross-level norm cases passed unchanged.
+Separate compiled 16K public/reference checks passed with maximum reported
+relative gradient errors 7.98e-7 and 8.84e-7; cold/warm results were identical.
+These arithmetic fixes preserve the model equations and existing guard
+thresholds. Their effect on training quality remains unmeasured.

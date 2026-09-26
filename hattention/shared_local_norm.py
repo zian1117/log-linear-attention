@@ -23,8 +23,9 @@ def _shared_core(k, v, beta, inverse, decay, levels, active_residuals):
     value_norm2 = v.square().sum(-1)
     current_norm2 = beta.square() * key_norm2 * value_norm2
     results = [(current_norm2, current_norm2.detach())]
-    # At the beginning of level l, prefix = v + sum_{s<l} active_D_s.
-    prefix = v
+    # Keep the old-state projection separate from v. Forming v+d and then
+    # subtracting v would lose d when the old state is small.
+    prefix_delta = torch.zeros_like(v)
     for level in range(1, levels):
         period = 1 << level
         half = period // 2
@@ -32,7 +33,8 @@ def _shared_core(k, v, beta, inverse, decay, levels, active_residuals):
         vector_shape = (*v.shape[:-2], groups, period, v.shape[-1])
         scalar_shape = (*beta.shape[:-1], groups, period)
         value = v.reshape(vector_shape)
-        preceding = prefix.reshape(vector_shape)
+        delta = prefix_delta.reshape(vector_shape)
+        preceding = value + delta
         # Materialize block layouts so dynamic batch sizes do not expose
         # symbolic diagonal strides to Inductor's CUDA matrix codegen.
         inv_block = _segment_blocks(inverse, period).contiguous()
@@ -48,9 +50,16 @@ def _shared_core(k, v, beta, inverse, decay, levels, active_residuals):
         residual_norm2 = residual.square().sum(-1)
         b = beta.reshape(scalar_shape)
         coefficient = b * (2 - b * key_norm2.reshape(scalar_shape))
-        cross = (value[..., :half, :] * preceding[..., :half, :]).sum(-1)
-        cross = torch.cat((cross, torch.zeros_like(cross)), dim=-1)
-        increments = 2 * b * cross - coefficient * residual_norm2
+        # For a write residual e=v+d, the exact energy increment is
+        # beta²*||k||²*||e||² - 2*beta*d·e. This avoids subtracting two
+        # O(beta) terms to recover an O(beta²) first-write energy.
+        write_increment = (b[..., :half].square()
+                           * key_norm2.reshape(scalar_shape)[..., :half]
+                           * residual_norm2[..., :half]
+                           - 2 * b[..., :half]
+                           * (delta[..., :half, :] * preceding[..., :half, :]).sum(-1))
+        erase_increment = -coefficient[..., half:] * residual_norm2[..., half:]
+        increments = torch.cat((write_increment, erase_increment), dim=-1)
         norm2 = (decay_block.square() @ increments.unsqueeze(-1)).squeeze(-1)
         with torch.no_grad():
             left_cross_bound = (value_norm2.reshape(scalar_shape)[..., :half].sqrt()
@@ -61,7 +70,7 @@ def _shared_core(k, v, beta, inverse, decay, levels, active_residuals):
         results.append((norm2.reshape_as(beta), bound.reshape_as(beta)))
         if level + 1 < levels:
             active = torch.cat((torch.zeros_like(active), active), dim=-2).reshape_as(v)
-            prefix = prefix + active
+            prefix_delta = prefix_delta + active
     return tuple(results)
 
 

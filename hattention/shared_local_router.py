@@ -7,7 +7,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .bucket_frobenius import _segment_blocks
 from .shared_local_norm import _shared_core as _shared_norm_core
-from .current_bucket_score import current_bucket_score
+from .current_bucket_score import current_bucket_score, previous_bucket_score
 
 _shared_norm_core = getattr(_shared_norm_core, '_torchdynamo_orig_callable', _shared_norm_core)
 
@@ -53,7 +53,14 @@ def _all_local(ar, aq, k, v, beta, u, q, temperature, inverse, decay,
         y,read = projections[level-1]
         y = y.to(output_dtype)
         query = u.reshape(*shape,u.shape[-1])[...,half:,:]
-        score = _score(read,query,norm2,temperature.unsqueeze(-1),floor)
+        if period == 2:
+            score = previous_bucket_score(
+                k.reshape(*shape,k.shape[-1]), v.reshape(*shape,v.shape[-1]),
+                beta.reshape(shape), decay_blocks[level-1],
+                u.reshape(*shape,u.shape[-1]), q.reshape(*shape,q.shape[-1]),
+                temperature.unsqueeze(-1),floor,norm2)
+        else:
+            score = _score(read,query,norm2,temperature.unsqueeze(-1),floor)
         with torch.no_grad():
             mass = (decay_blocks[level-1][...,half:,:half]
                     @ positive_mass.reshape(shape)[...,:half].unsqueeze(-1)).squeeze(-1)

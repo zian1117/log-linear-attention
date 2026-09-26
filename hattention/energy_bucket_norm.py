@@ -27,10 +27,15 @@ def _right_terms(k, beta, cumulative_decay):
 @torch.compile
 def _local_energy(inverse, decay, beta, key_norm2, value, writes):
     written_value = value * writes.unsqueeze(-1)
-    residual = (inverse * decay) @ written_value
+    # The inverse has a unit diagonal. Preserve the old-state projection
+    # separately so the first write does not subtract O(beta) energies.
+    delta = (inverse * decay).tril(-1) @ written_value
+    residual = written_value + delta
     residual_norm2 = residual.square().sum(-1)
     coefficient = beta * (2 - beta * key_norm2)
-    increments = 2 * beta * (written_value * residual).sum(-1) - coefficient * residual_norm2
+    write_increment = (beta.square() * key_norm2 * residual_norm2
+                       - 2 * beta * (delta * residual).sum(-1))
+    increments = torch.where(writes, write_increment, -coefficient * residual_norm2)
     norm2 = (decay.square() @ increments.unsqueeze(-1)).squeeze(-1)
     with torch.no_grad():
         cross_bound = written_value.square().sum(-1).sqrt() * residual_norm2.sqrt()
