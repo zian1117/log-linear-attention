@@ -58,6 +58,10 @@ class HGatedDeltaNet(GatedDeltaNet):
         layer_idx: int = None,
         norm_eps: float = 1e-5,
         matrix_router: bool = False,
+        matrix_router_key: str = "single_probe",
+        matrix_router_norm_floor: float = 1e-6,
+        matrix_router_vector_eps: float = 1e-6,
+        matrix_router_initializer_range: float = 0.006,
         **kwargs
     ) -> None:
         super().__init__(
@@ -79,7 +83,11 @@ class HGatedDeltaNet(GatedDeltaNet):
         if matrix_router:
             from hattention.matrix_router_module import MatrixMemoryRouter
             self.router = MatrixMemoryRouter(hidden_size, self.num_heads,
-                self.head_k_dim, self.head_v_dim)
+                self.head_k_dim, self.head_v_dim,
+                key_mode=matrix_router_key,
+                norm_floor=matrix_router_norm_floor,
+                vector_eps=matrix_router_vector_eps,
+                initializer_range=matrix_router_initializer_range)
         else:
             self.lambdas_dim = int(self.num_heads * MAX_NUM_LEVELS)
             self.l_proj = nn.Linear(hidden_size, self.lambdas_dim, bias=False)
@@ -114,6 +122,11 @@ class HGatedDeltaNet(GatedDeltaNet):
             last_state = past_key_values[self.layer_idx]
 
         cu_seqlens = kwargs.get('cu_seqlens', None)
+        if (self.matrix_router and self.router.key_mode == 'bilinear_frobenius'
+                and cu_seqlens is not None):
+            raise NotImplementedError(
+                'Bilinear matrix routing does not support packed sequences; '
+                'cu_seqlens must be None.')
         if self.use_short_conv:
             conv_state_q, conv_state_k, conv_state_v = None, None, None
             if last_state is not None:
@@ -251,6 +264,10 @@ class HGatedDeltaNetBlock(nn.Module):
                 norm_eps=config.norm_eps,
                 layer_idx=layer_idx,
                 matrix_router=getattr(config, 'matrix_router', False),
+                matrix_router_key=getattr(config, 'matrix_router_key', 'single_probe'),
+                matrix_router_norm_floor=getattr(config, 'matrix_router_norm_floor', 1e-6),
+                matrix_router_vector_eps=getattr(config, 'matrix_router_vector_eps', 1e-6),
+                matrix_router_initializer_range=config.initializer_range,
             )
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = GatedDeltaNetMLP(
