@@ -95,8 +95,8 @@ dimension 64, versus the previous `single_probe` implementation (`e8fcd9f`):
 
 | GPU / job | Bilinear layer | Reference layer | Ratio | Peak allocated memory, new / reference |
 | --- | ---: | ---: | ---: | ---: |
-| L40S / 23998204 | 0.7078 s | 0.4371 s | 1.62x | 30.11 / 13.75 GB |
-| H200 / 23998100 | 0.1914 s | 0.07337 s | 2.61x | 30.13 / 13.80 GB |
+| L40S / 23998754 | 0.7111 s | 0.4374 s | 1.63x | 30.11 / 13.75 GB |
+| H200 / 23998737 | 0.1954 s | 0.07384 s | 2.65x | 30.13 / 13.80 GB |
 
 These are warmed layer measurements with common parameters matched, using an
 initialized first layer and saved validation tokens; they are not complete
@@ -128,6 +128,7 @@ python tests/test_multi_active_select.py
 python tests/test_multi_projected_states.py
 python tests/test_compact_projected_states.py
 python tests/test_shared_precise_input_cache.py
+python tests/test_current_bucket_score.py
 python tests/test_tuple_routing_reduce.py
 python tests/test_multi_cache_gather.py
 python tests/test_grouped_cache_orchestration.py
@@ -189,3 +190,32 @@ Remaining work:
   errors without changing the conceptual model; retain independent references
   and regression cases. Initialization and stress-case checks do not certify
   every state encountered during a trained multi-layer trajectory.
+
+The current-token score now cancels its write-strength factor algebraically
+above the Frobenius floor. For this rank-one bucket the score is
+`temperature * sign(beta) * dot(q,k) * dot(u,v) / (norm(k)*norm(v))`;
+below the floor it remains `temperature * beta * dot(q,k) * dot(u,v) / floor`.
+Direct normalized q is supplied to both shared and separate local paths;
+dividing the already beta-weighted read by beta would retain the problematic
+backward cancellation. The value read and its legitimate beta gradient are
+unchanged. The existing norm estimate still selects the floor branch and
+precision diagnostics; inactive reciprocal denominators are protected at zero.
+
+In constructed two-token examples with aligned routing queries and current
+beta=3e-6, FP32 score cancellation caused 51–77% relative error in the sigmoid
+write-strength parameter gradient after gated RMSNorm. Algebraic cancellation
+reduced that error to approximately 4e-6. These are stress cases, not estimates
+of training prevalence or loss impact. The helper is independently checked
+against a literal matrix formula, including all six gradients, zero vectors,
+negative beta, and exact floor equality. The actual shared-local regression
+also verifies that no precision repair hides the result.
+
+H200 `23998737` and L40S `23998754` passed those CPU/GPU checks and separate
+compiled 16K public-path output/all-eight-gradient comparisons. Maximum
+reported relative gradient errors were 6.51e-7 and 9.45e-7; cold/warm results
+were identical. The mixed-head and boundary CPU integration regressions passed.
+
+The broader numerical audit is ongoing. A constructed singleton-history case
+has additionally exposed avoidable subtraction in the write-energy identity
+used by local Frobenius norms; correcting only the current-token score does
+not fix that separate path. Its stable algebraic rewrite is being tested.

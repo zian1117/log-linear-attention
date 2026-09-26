@@ -12,6 +12,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .bilinear_matrix_gdn import _CHUNK_SIZE, _gdn_normalize
 from .tuple_routing_reduce import tuple_routing_reduce
+from .current_bucket_score import current_bucket_score
 from .bucket_frobenius import _segment_blocks
 from .energy_bucket_norm import _local_energy, _high_energy
 from .fenwick_gather import active_select, active_scatter
@@ -104,11 +105,10 @@ def _diagnostics(norm2, bound, mass, score, y, floor):
     return bad | nonfinite, nonfinite
 
 
-def _current_core(ar, aq, k, v, beta, u, temperature, floor, output_dtype, return_masks=False):
+def _current_core(ar, k, v, beta, u, q, temperature, floor, output_dtype, return_masks=False):
     norm2 = beta.square()*k.square().sum(-1)*v.square().sum(-1)
     y = ar.diagonal(dim1=-2, dim2=-1).unsqueeze(-1)*v
-    read = aq.diagonal(dim1=-2, dim2=-1).unsqueeze(-1)*v
-    score = _score(read, u, norm2, temperature, floor)
+    score = current_bucket_score(k, v, beta, u, q, temperature, floor, norm2)
     y = y.to(output_dtype)
     bad, nonfinite = _diagnostics(norm2, norm2, norm2.clamp_min(0).sqrt(), score, y, floor)
     if return_masks:
@@ -187,9 +187,9 @@ def _checkpoint_coarse_core(*args):
     return checkpoint(_coarse_core, *args, use_reentrant=False)
 
 
-def _local(ar, aq, k, v, beta, gc, u, temperature, level, terms, floor, output_dtype, return_masks=False):
+def _local(ar, aq, k, v, beta, gc, u, temperature, level, terms, floor, output_dtype, return_masks=False, *, q):
     if level == 0:
-        args = (ar, aq, k, v, beta, u, temperature, floor, output_dtype, return_masks)
+        args = (ar, k, v, beta, u, q, temperature, floor, output_dtype, return_masks)
         return _checkpoint_current_core(*args) if torch.is_grad_enabled() else _current_core(*args)
     period = 1 << level
     shape = (*beta.shape[:-1], k.shape[-2]//period, period)
@@ -386,13 +386,13 @@ def fast_matrix_gdn(r, k, v, g, beta, u, q, log_temperature, norm_floor=1e-6, ve
             from .shared_local_router import shared_local_router
             ys,scores,flags,nonfinite = shared_local_router(
                 ar,aq,k,v,beta,gc,u,temperature,terms,norm_floor,output_dtype,
-                local_levels,use_fused=fused_local)
+                local_levels,q=q,use_fused=fused_local)
             if not repair_periods:
                 flags = [x.flatten(1).any(-1) for x in flags]
         else:
             for level in range(local_levels):
                 args=(ar,aq,k,v,beta,gc,u,temperature,level,terms,norm_floor,output_dtype,repair_periods)
-                y,score,*diagnostic=_local(*args)
+                y,score,*diagnostic=_local(*args,q=q)
                 ys.append(y);scores.append(score);flags.append(diagnostic[0])
                 if repair_periods:
                     nonfinite.append(diagnostic[1])

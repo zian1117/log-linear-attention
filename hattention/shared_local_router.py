@@ -7,11 +7,12 @@ from torch.utils.checkpoint import checkpoint
 
 from .bucket_frobenius import _segment_blocks
 from .shared_local_norm import _shared_core as _shared_norm_core
+from .current_bucket_score import current_bucket_score
 
 _shared_norm_core = getattr(_shared_norm_core, '_torchdynamo_orig_callable', _shared_norm_core)
 
 
-def _all_local(ar, aq, k, v, beta, u, temperature, inverse, decay,
+def _all_local(ar, aq, k, v, beta, u, q, temperature, inverse, decay,
                floor, output_dtype, levels, use_fused):
     from .fast_matrix_gdn import _score, _diagnostics
     torch._dynamo.mark_static(k,-2)
@@ -40,9 +41,8 @@ def _all_local(ar, aq, k, v, beta, u, temperature, inverse, decay,
     norms = _shared_norm_core(k,v,beta,inverse,decay,levels,tuple(residuals))
     result = []
     y = (ar.diagonal(dim1=-2,dim2=-1).unsqueeze(-1)*v).to(output_dtype)
-    read = aq.diagonal(dim1=-2,dim2=-1).unsqueeze(-1)*v
     norm2,bound = norms[0]
-    score = _score(read,u,norm2,temperature,floor)
+    score = current_bucket_score(k,v,beta,u,q,temperature,floor,norm2)
     bad,nonfinite = _diagnostics(norm2,bound,norm2.clamp_min(0).sqrt(),score,y,floor)
     result.extend((y,score,bad,nonfinite))
     for level in range(1,levels):
@@ -78,8 +78,8 @@ def _compiled_shape(chunk,key_dim,value_dim,input_dtype,output_dtype,floor,level
 
 
 def shared_local_router(ar,aq,k,v,beta,gc,u,temperature,terms,floor,output_dtype,levels,
-                        use_fused=False):
-    args = (ar,aq,k,v,beta,u,temperature,terms[1],terms[2],floor,output_dtype,levels,use_fused)
+                        *, q, use_fused=False):
+    args = (ar,aq,k,v,beta,u,q,temperature,terms[1],terms[2],floor,output_dtype,levels,use_fused)
     if torch.is_grad_enabled():
         values = _compiled_shape(k.shape[-2],k.shape[-1],v.shape[-1],k.dtype,output_dtype,
                                  floor,levels,use_fused)(*args)
